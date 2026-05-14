@@ -896,37 +896,35 @@ class OCIModel(RegistryDataInterface):
         """
         Returns the blob in the repository with the given digest, if any or None if none.
 
-        Two-path lookup:
-        - SHA-256 digests: lookup via canonical_sha256 (single source of truth)
-        - Non-SHA-256 digests: lookup via content_checksum, fallback to DigestAlias
+        Single pull path: always look up by content_checksum. canonical_sha256 is used
+        only for internal operations (dedup, GC, storage paths), never for retrieval.
+
+        For non-SHA-256 digests, falls back to DigestAlias resolution if no direct
+        content_checksum match is found.
 
         Note that there may be multiple records in the same repository for the same blob digest, so
         the return value of this function may change.
         """
         image_storage = self._get_shared_storage(blob_digest)
         if image_storage is None:
-            parsed = digest_tools.Digest.parse_digest(blob_digest)
+            # Single path: look up by content_checksum for all algorithms
+            image_storage = oci.blob.get_repository_blob_by_digest(
+                repository_ref._db_id, blob_digest
+            )
 
-            if parsed.hash_alg == "sha256":
-                # SHA-256 lookup: canonical_sha256 is the single source of truth
-                image_storage = oci.blob.get_repository_blob_by_canonical_sha256(
-                    repository_ref._db_id, blob_digest
-                )
-            else:
-                # Non-SHA-256 lookup: try content_checksum column directly
-                if not getattr(features, "MULTI_ALGORITHM_SUPPORT", False):
-                    return None
-                image_storage = oci.blob.get_repository_blob_by_digest(
-                    repository_ref._db_id, blob_digest
-                )
-                # Fallback: DigestAlias (for cross-algorithm dedup references)
-                if image_storage is None:
+            # Fallback: DigestAlias (for cross-algorithm dedup references)
+            if image_storage is None:
+                parsed = digest_tools.Digest.parse_digest(blob_digest)
+                if parsed.hash_alg != "sha256" and getattr(
+                    features, "MULTI_ALGORITHM_SUPPORT", False
+                ):
                     from data.model.blob import resolve_blob_by_digest_alias
 
                     alias_storage = resolve_blob_by_digest_alias(blob_digest)
                     if alias_storage is not None:
+                        # Re-lookup by the canonical content_checksum
                         canonical = alias_storage.effective_canonical_sha256
-                        image_storage = oci.blob.get_repository_blob_by_canonical_sha256(
+                        image_storage = oci.blob.get_repository_blob_by_digest(
                             repository_ref._db_id, canonical
                         )
 
@@ -1215,8 +1213,6 @@ class OCIModel(RegistryDataInterface):
         byte_count,
         chunk_count,
         sha_state,
-        client_hash_state=None,
-        client_hash_algorithm=None,
     ):
         """
         Updates the fields of the blob upload to match those given.
@@ -1233,8 +1229,6 @@ class OCIModel(RegistryDataInterface):
             upload_record.byte_count = byte_count
             upload_record.chunk_count = chunk_count
             upload_record.sha_state = sha_state
-            upload_record.client_hash_state = client_hash_state
-            upload_record.client_hash_algorithm = client_hash_algorithm
             upload_record.save()
             return BlobUpload.for_upload(upload_record)
 

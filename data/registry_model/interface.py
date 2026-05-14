@@ -354,8 +354,6 @@ class RegistryDataInterface(object):
         byte_count,
         chunk_count,
         sha_state,
-        client_hash_state=None,
-        client_hash_algorithm=None,
     ):
         """
         Updates the fields of the blob upload to match those given.

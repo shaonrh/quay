@@ -3,7 +3,6 @@ import os
 import tarfile
 from contextlib import closing
 from io import BytesIO
-from test.fixtures import *
 
 import pytest
 
@@ -18,6 +17,7 @@ from data.registry_model.blobuploader import (
 from data.registry_model.registry_oci_model import OCIModel
 from storage.distributedstorage import DistributedStorage
 from storage.fakestorage import FakeStorage
+from test.fixtures import *
 
 
 @pytest.fixture()
@@ -153,3 +153,112 @@ def test_uncompressed_size(registry_model):
 
     assert blob.compressed_size is not None
     assert blob.uncompressed_size is not None
+
+
+def test_monolithic_upload_with_sha512_digest(registry_model):
+    """Upload blob and finalize with digest=sha512:... — on-demand validation via read-back."""
+    repository_ref = registry_model.lookup_repository("devtable", "complex")
+    storage = DistributedStorage({"local_us": FakeStorage(None)}, ["local_us"])
+    settings = BlobUploadSettings("2M", 3600)
+    app_config = {
+        "TESTING": True,
+        "FEATURE_MULTI_ALGORITHM_SUPPORT": True,
+        "ALLOWED_HASH_ALGORITHMS": ["sha256", "sha512"],
+    }
+
+    data = os.urandom(256)
+    expected_sha512 = "sha512:" + hashlib.sha512(data).hexdigest()
+    expected_sha256 = "sha256:" + hashlib.sha256(data).hexdigest()
+
+    with upload_blob(repository_ref, storage, settings) as manager:
+        manager.upload_chunk(app_config, BytesIO(data))
+        blob = manager.commit_to_blob(app_config, expected_digest=expected_sha512)
+
+    # Blob committed successfully
+    assert blob is not None
+    # Storage path is SHA-256-based (canonical)
+    assert storage.get_content(["local_us"], blob.storage_path) == data
+    # Digest on the blob object is the canonical SHA-256
+    assert blob.digest == expected_sha256
+
+
+def test_chunked_upload_with_sha512_finalization(registry_model):
+    """Multi-chunk upload finalized with sha512 — read-back validates across chunks."""
+    repository_ref = registry_model.lookup_repository("devtable", "complex")
+    storage = DistributedStorage({"local_us": FakeStorage(None)}, ["local_us"])
+    settings = BlobUploadSettings("2M", 3600)
+    app_config = {
+        "TESTING": True,
+        "FEATURE_MULTI_ALGORITHM_SUPPORT": True,
+        "ALLOWED_HASH_ALGORITHMS": ["sha256", "sha512"],
+    }
+
+    chunks = [os.urandom(100) for _ in range(5)]
+    full_data = b"".join(chunks)
+    expected_sha512 = "sha512:" + hashlib.sha512(full_data).hexdigest()
+
+    with upload_blob(repository_ref, storage, settings) as manager:
+        for chunk in chunks:
+            manager.upload_chunk(app_config, BytesIO(chunk))
+        blob = manager.commit_to_blob(app_config, expected_digest=expected_sha512)
+
+    assert blob is not None
+    assert storage.get_content(["local_us"], blob.storage_path) == full_data
+
+
+def test_sha512_digest_mismatch(registry_model):
+    """Wrong sha512 digest raises BlobDigestMismatchException."""
+    repository_ref = registry_model.lookup_repository("devtable", "complex")
+    storage = DistributedStorage({"local_us": FakeStorage(None)}, ["local_us"])
+    settings = BlobUploadSettings("2M", 3600)
+    app_config = {
+        "TESTING": True,
+        "FEATURE_MULTI_ALGORITHM_SUPPORT": True,
+        "ALLOWED_HASH_ALGORITHMS": ["sha256", "sha512"],
+    }
+
+    data = os.urandom(256)
+    wrong_sha512 = "sha512:" + hashlib.sha512(b"wrong data").hexdigest()
+
+    with upload_blob(repository_ref, storage, settings) as manager:
+        manager.upload_chunk(app_config, BytesIO(data))
+        with pytest.raises(BlobDigestMismatchException):
+            manager.commit_to_blob(app_config, expected_digest=wrong_sha512)
+
+
+def test_non_sha256_rejected_when_feature_disabled(registry_model):
+    """Non-SHA-256 digest rejected when FEATURE_MULTI_ALGORITHM_SUPPORT is disabled."""
+    repository_ref = registry_model.lookup_repository("devtable", "complex")
+    storage = DistributedStorage({"local_us": FakeStorage(None)}, ["local_us"])
+    settings = BlobUploadSettings("2M", 3600)
+    app_config = {
+        "TESTING": True,
+        "FEATURE_MULTI_ALGORITHM_SUPPORT": False,
+    }
+
+    data = os.urandom(256)
+    sha512_digest = "sha512:" + hashlib.sha512(data).hexdigest()
+
+    with upload_blob(repository_ref, storage, settings) as manager:
+        manager.upload_chunk(app_config, BytesIO(data))
+        with pytest.raises(BlobDigestMismatchException):
+            manager.commit_to_blob(app_config, expected_digest=sha512_digest)
+
+
+def test_sha256_upload_no_readback(registry_model):
+    """Standard SHA-256 upload does not trigger storage read-back — fast path unchanged."""
+    repository_ref = registry_model.lookup_repository("devtable", "complex")
+    storage = DistributedStorage({"local_us": FakeStorage(None)}, ["local_us"])
+    settings = BlobUploadSettings("2M", 3600)
+    app_config = {"TESTING": True}
+
+    data = os.urandom(256)
+    expected_sha256 = "sha256:" + hashlib.sha256(data).hexdigest()
+
+    with upload_blob(repository_ref, storage, settings) as manager:
+        manager.upload_chunk(app_config, BytesIO(data))
+        blob = manager.commit_to_blob(app_config, expected_digest=expected_sha256)
+
+    assert blob is not None
+    assert blob.digest == expected_sha256
+    assert storage.get_content(["local_us"], blob.storage_path) == data
