@@ -140,3 +140,6 @@ class TestConfig(DefaultConfig):
     DEFAULT_UI = "angular"
 
     FEATURE_OTEL_TRACING = True
+
+    FEATURE_MULTI_ALGORITHM_SUPPORT = True
+    ALLOWED_HASH_ALGORITHMS = ["sha256", "sha512"]

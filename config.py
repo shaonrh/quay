@@ -441,6 +441,13 @@ class DefaultConfig(ImmutableConfig):
     # Feature Flag: If set to true, Quay will run using FIPS compliant hash functions.
     FEATURE_FIPS = False
 
+    # Feature Flag: Whether multi-algorithm digest support (SHA-384, SHA-512) is enabled
+    # for blob and manifest uploads. When False, only SHA-256 digests are accepted.
+    FEATURE_MULTI_ALGORITHM_SUPPORT = False
+
+    # List of hash algorithms accepted for blob uploads. sha256 is always required.
+    ALLOWED_HASH_ALGORITHMS: List[str] = ["sha256"]
+
     # If a namespace is defined in the public namespace list, then it will appear on *all*
     # user's repository list pages, regardless of whether that user is a member of the namespace.
     # Typically, this is used by an enterprise customer in configuring a set of "well-known"

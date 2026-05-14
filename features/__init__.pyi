@@ -233,3 +233,6 @@ OTEL_TRACING: FeatureNameValue
 
 # Feature Flag: If set to true, enables programmatic bootstrap token provisioning.
 PROGRAMMATIC_BOOTSTRAP: FeatureNameValue
+
+# Feature Flag: Whether multi-algorithm digest support (SHA-384, SHA-512) is enabled.
+MULTI_ALGORITHM_SUPPORT: FeatureNameValue
