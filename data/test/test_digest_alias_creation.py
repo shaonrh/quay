@@ -60,11 +60,13 @@ def test_db():
         uuid="test-uuid-aaaa",
         cas_path=True,
         content_checksum="sha256:aaaa",
+        canonical_sha256="sha256:aaaa",
     )
     storage_b = ImageStorage.create(
         uuid="test-uuid-bbbb",
         cas_path=True,
         content_checksum="sha256:bbbb",
+        canonical_sha256="sha256:bbbb",
     )
 
     yield {

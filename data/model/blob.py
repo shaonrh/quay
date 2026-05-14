@@ -42,9 +42,10 @@ class DigestAliasCollisionError(Exception):
     """
 
 
-def create_digest_alias(client_digest_str, image_storage):
+def create_digest_alias(client_digest_str, image_storage, manifest=None):
     """
     Creates a DigestAlias mapping client_digest_str to the given ImageStorage.
+    Optionally links to a Manifest (for manifest aliases).
     Idempotent for same-storage mappings. Raises DigestAliasCollisionError on collision.
 
     Also increments the Prometheus counter for observability.
@@ -53,12 +54,14 @@ def create_digest_alias(client_digest_str, image_storage):
         DigestAlias.create(
             digest=client_digest_str,
             image_storage=image_storage,
+            manifest=manifest,
         )
         logger.info(
-            "Created DigestAlias: %s -> ImageStorage %s (content_checksum=%s)",
+            "Created DigestAlias: %s -> ImageStorage %s (content_checksum=%s, manifest=%s)",
             client_digest_str,
             image_storage.id,
             image_storage.content_checksum,
+            manifest.id if manifest else None,
         )
         # Increment Prometheus counter
         algo = client_digest_str.split(":", 1)[0]
@@ -85,6 +88,18 @@ def create_digest_alias(client_digest_str, image_storage):
             )
 
 
+def resolve_blob_by_digest_alias(blob_digest):
+    """
+    Resolves a non-SHA-256 digest to an ImageStorage via the DigestAlias table.
+    Returns the ImageStorage row or None if no alias exists.
+    """
+    try:
+        alias = DigestAlias.get(DigestAlias.digest == blob_digest)
+        return alias.image_storage
+    except DigestAlias.DoesNotExist:
+        return None
+
+
 def store_blob_record_and_temp_link(
     namespace,
     repo_name,
@@ -97,14 +112,23 @@ def store_blob_record_and_temp_link(
     repo = _basequery.get_existing_repository(namespace, repo_name)
     assert repo
 
+    # When called via old interface, content_checksum = canonical_sha256 = blob_digest
+    # (all existing callers pass SHA-256)
     return store_blob_record_and_temp_link_in_repo(
-        repo.id, blob_digest, location_obj, byte_count, link_expiration_s, uncompressed_byte_count
+        repo.id,
+        blob_digest,
+        blob_digest,
+        location_obj,
+        byte_count,
+        link_expiration_s,
+        uncompressed_byte_count,
     )
 
 
 def _store_blob_record_and_temp_link_in_repo(
     repository_id,
-    blob_digest,
+    content_checksum,
+    canonical_sha256,
     location_obj,
     byte_count,
     link_expiration_s,
@@ -112,12 +136,19 @@ def _store_blob_record_and_temp_link_in_repo(
     skip_lock=False,
 ):
     """
-    Helper function that creates the necessary placements in specific tables. Returns the storage object
-    back to the caller function.
+    Helper: creates ImageStorage (or reuses existing via canonical_sha256 dedup),
+    creates placement, and temp-links to repository.
     """
     with db_transaction():
-        try:
-            storage = ImageStorage.get(content_checksum=blob_digest)
+        # Dedup by canonical_sha256: same content = same SHA-256 = same storage
+        existing = (
+            ImageStorage.select()
+            .where(ImageStorage.canonical_sha256 == canonical_sha256)
+            .first()  # .first() not .get() -- handles rare multi-row case
+        )
+
+        if existing is not None:
+            storage = existing
             save_changes = False
 
             if storage.image_size is None:
@@ -131,9 +162,23 @@ def _store_blob_record_and_temp_link_in_repo(
             if save_changes:
                 storage.save()
 
-        except ImageStorage.DoesNotExist:
+            # If client used a different digest than what's stored, create DigestAlias
+            # so the client's digest is retrievable (OQ5 resolution: Option a)
+            if content_checksum != storage.content_checksum:
+                try:
+                    create_digest_alias(content_checksum, storage)
+                except DigestAliasCollisionError:
+                    # Another ImageStorage has this digest -- should not happen
+                    # with correct content-addressing, but log and continue
+                    logger.warning(
+                        "DigestAlias collision for %s during dedup",
+                        content_checksum,
+                    )
+        else:
+            # No existing storage -- create new
             storage = get_or_create_blob_with_lock(
-                digest=blob_digest,
+                content_checksum=content_checksum,
+                canonical_sha256=canonical_sha256,
                 image_size=byte_count,
                 uncompressed_size=uncompressed_byte_count,
                 skip_lock=skip_lock,
@@ -146,8 +191,8 @@ def _store_blob_record_and_temp_link_in_repo(
                 ImageStoragePlacement.create(storage=storage, location=location_obj)
             except IntegrityError as e:
                 logger.warning(
-                    "Another worker already created placeholder for blob %s, skipping creation: %s",
-                    blob_digest,
+                    "Another worker already created placement for blob %s: %s",
+                    canonical_sha256,
                     e,
                 )
 
@@ -157,7 +202,8 @@ def _store_blob_record_and_temp_link_in_repo(
 
 def store_blob_record_and_temp_link_in_repo(
     repository_id,
-    blob_digest,
+    content_checksum,
+    canonical_sha256,
     location_obj,
     byte_count,
     link_expiration_s,
@@ -165,15 +211,21 @@ def store_blob_record_and_temp_link_in_repo(
 ):
     """
     Store a record of the blob and temporarily link it to the specified repository.
+
+    Lock coordination uses canonical_sha256 to match GC's lock key.
+    Dedup uses canonical_sha256 to find existing storage for same content.
     """
-    assert blob_digest
+    assert content_checksum
+    assert canonical_sha256
     assert byte_count is not None
 
+    # Lock on canonical_sha256 -- same key GC uses for deletion coordination
     return with_blob_lock_or_fallback(
-        blob_digest,
+        canonical_sha256,
         _store_blob_record_and_temp_link_in_repo,
         repository_id=repository_id,
-        blob_digest=blob_digest,
+        content_checksum=content_checksum,
+        canonical_sha256=canonical_sha256,
         location_obj=location_obj,
         byte_count=byte_count,
         link_expiration_s=link_expiration_s,
@@ -185,15 +237,26 @@ def temp_link_blob(repository_id, blob_digest, link_expiration_s):
     """
     Temporarily links to the blob record from the given repository.
 
+    Supports lookup by either content_checksum or canonical_sha256, so that:
+    - Direct digest lookups work (content_checksum match)
+    - SHA-256 lookups work for blobs uploaded with non-SHA-256 (canonical_sha256 match)
+    - Feature flag rollback doesn't break blob access
+
     If the blob record is not found, return None.
     """
     assert blob_digest
 
     with db_transaction():
+        # Try content_checksum first (direct match)
         try:
             storage = ImageStorage.get(content_checksum=blob_digest)
         except ImageStorage.DoesNotExist:
-            return None
+            # Fallback: try canonical_sha256 (SHA-256 lookup for non-SHA-256 blobs)
+            storage = (
+                ImageStorage.select().where(ImageStorage.canonical_sha256 == blob_digest).first()
+            )
+            if storage is None:
+                return None
 
         _temp_link_blob(repository_id, storage, link_expiration_s)
         return storage

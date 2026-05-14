@@ -904,6 +904,15 @@
       "ct-validate": "",
       "ct-fieldgroups": ["RegistrySettings"]
     },
+    "MULTI_ALGO_MAX_TAGS_PER_REQUEST": {
+      "x-example": 100,
+      "type": "integer",
+      "minimum": 1,
+      "description": "Maximum number of tag query parameters allowed in a single PUT /v2/<name>/manifests/<digest> request (OCI end-7b). Defaults to 100.",
+      "ct-default": "100",
+      "ct-validate": "",
+      "ct-fieldgroups": ["RegistrySettings"]
+    },
     "BUILDLOGS_REDIS": {
       "required": ["host"],
       "type": "object",

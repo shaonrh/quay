@@ -1318,7 +1318,29 @@ class ImageStorage(BaseModel):
     uncompressed_size = BigIntegerField(null=True)
     uploading = BooleanField(default=True, null=True)
     cas_path = BooleanField(default=True)
+    # content_checksum: Algorithm-agnostic. Stores whatever digest the client
+    # provided at upload time (e.g. sha256:xxx, sha512:yyy).
     content_checksum = CharField(null=True, index=True)
+    # canonical_sha256: Always SHA-256. Used for internal operations: storage
+    # paths, GC coordination, deduplication, manifest layer resolution.
+    # For existing blobs, canonical_sha256 == content_checksum.
+    # Nullable in model to support rolling deployment (Migration 1 adds nullable,
+    # Migration 2 backfills and sets NOT NULL). Use effective_canonical_sha256
+    # property for safe access.
+    canonical_sha256 = CharField(null=True, max_length=255, index=True)
+
+    @property
+    def effective_canonical_sha256(self):
+        """
+        Returns canonical_sha256 if populated, otherwise falls back to content_checksum.
+
+        This transitional property handles the rolling deployment window where
+        Migration 1 has added the column (nullable) but Migration 2 hasn't yet
+        backfilled all rows. After Migration 2 completes, this property always
+        returns canonical_sha256. Can be replaced with direct canonical_sha256
+        access after the migration window closes.
+        """
+        return self.canonical_sha256 or self.content_checksum
 
 
 class ImageStorageTransformation(BaseModel):
@@ -1679,6 +1701,7 @@ class UploadedBlob(BaseModel):
 class DigestAlias(BaseModel):
     digest = CharField(max_length=512, unique=True, index=True)
     image_storage = ForeignKeyField(ImageStorage, backref="digest_aliases")
+    manifest = DeferredForeignKey("Manifest", null=True, backref="digest_aliases")
     created_at = DateTimeField(default=datetime.utcnow)
 
 

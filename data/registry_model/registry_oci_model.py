@@ -42,6 +42,7 @@ from data.registry_model.label_handlers import (
     apply_label_to_manifest,
 )
 from data.registry_model.shared import SyntheticIDHandler
+from digest import digest_tools
 from image.docker.schema1 import DOCKER_SCHEMA1_CONTENT_TYPES
 from image.docker.schema2 import EMPTY_LAYER_BLOB_DIGEST, EMPTY_LAYER_BYTES
 from image.oci import OCI_IMAGE_INDEX_CONTENT_TYPE
@@ -272,6 +273,18 @@ class OCIModel(RegistryDataInterface):
             allow_hidden=allow_hidden,
             require_available=require_available,
         )
+
+        if manifest is None:
+            # Fallback: resolve non-SHA-256 digest via DigestAlias
+            if getattr(features, "MULTI_ALGORITHM_SUPPORT", False):
+                parsed_digest = digest_tools.Digest.parse_digest(manifest_digest)
+                if parsed_digest.hash_alg != "sha256":
+                    manifest = oci.manifest.lookup_manifest_by_digest_alias(
+                        repository_ref._db_id,
+                        manifest_digest,
+                        allow_dead=allow_dead,
+                        allow_hidden=allow_hidden,
+                    )
 
         if manifest is None:
             if raise_on_error:
@@ -883,14 +896,40 @@ class OCIModel(RegistryDataInterface):
         """
         Returns the blob in the repository with the given digest, if any or None if none.
 
+        Two-path lookup:
+        - SHA-256 digests: lookup via canonical_sha256 (single source of truth)
+        - Non-SHA-256 digests: lookup via content_checksum, fallback to DigestAlias
+
         Note that there may be multiple records in the same repository for the same blob digest, so
         the return value of this function may change.
         """
         image_storage = self._get_shared_storage(blob_digest)
         if image_storage is None:
-            image_storage = oci.blob.get_repository_blob_by_digest(
-                repository_ref._db_id, blob_digest
-            )
+            parsed = digest_tools.Digest.parse_digest(blob_digest)
+
+            if parsed.hash_alg == "sha256":
+                # SHA-256 lookup: canonical_sha256 is the single source of truth
+                image_storage = oci.blob.get_repository_blob_by_canonical_sha256(
+                    repository_ref._db_id, blob_digest
+                )
+            else:
+                # Non-SHA-256 lookup: try content_checksum column directly
+                if not getattr(features, "MULTI_ALGORITHM_SUPPORT", False):
+                    return None
+                image_storage = oci.blob.get_repository_blob_by_digest(
+                    repository_ref._db_id, blob_digest
+                )
+                # Fallback: DigestAlias (for cross-algorithm dedup references)
+                if image_storage is None:
+                    from data.model.blob import resolve_blob_by_digest_alias
+
+                    alias_storage = resolve_blob_by_digest_alias(blob_digest)
+                    if alias_storage is not None:
+                        canonical = alias_storage.effective_canonical_sha256
+                        image_storage = oci.blob.get_repository_blob_by_canonical_sha256(
+                            repository_ref._db_id, canonical
+                        )
+
             if image_storage is None:
                 return None
 
@@ -1209,12 +1248,16 @@ class OCIModel(RegistryDataInterface):
                 upload_record.delete_instance()
 
     def commit_blob_upload(
-        self, blob_upload, blob_digest_str, blob_expiration_seconds, client_digest_str=None
+        self, blob_upload, content_checksum, canonical_sha256, blob_expiration_seconds
     ):
         """
         Commits the blob upload into a blob and sets an expiration before that blob will be GCed.
-        If client_digest_str is provided (non-SHA-256 digest), creates a DigestAlias mapping it
-        to the ImageStorage record.
+
+        Args:
+            blob_upload: BlobUpload reference
+            content_checksum: Client-facing digest (algorithm-agnostic)
+            canonical_sha256: Always SHA-256 digest for internal operations
+            blob_expiration_seconds: Expiration for the temp link
         """
         with db_disallow_replica_use():
             upload_record = model.blob.get_blob_upload_by_uuid(blob_upload.upload_id)
@@ -1222,21 +1265,18 @@ class OCIModel(RegistryDataInterface):
                 return None
 
             repository_id = upload_record.repository_id
-
-            # Create the blob and temporarily tag it.
             location_obj = model.storage.get_image_location_for_name(blob_upload.location_name)
+
+            # Dedup by canonical_sha256, lock by canonical_sha256
             blob_record = model.blob.store_blob_record_and_temp_link_in_repo(
                 repository_id,
-                blob_digest_str,
+                content_checksum,
+                canonical_sha256,
                 location_obj.id,
                 blob_upload.byte_count,
                 blob_expiration_seconds,
                 blob_upload.uncompressed_byte_count,
             )
-
-            # Create DigestAlias if a client-algorithm digest was provided
-            if client_digest_str is not None:
-                model.blob.create_digest_alias(client_digest_str, blob_record)
 
             # Delete the blob upload.
             upload_record.delete_instance()
@@ -1249,12 +1289,18 @@ class OCIModel(RegistryDataInterface):
         Mounts the blob from another repository into the specified target repository, and adds an
         expiration before that blob is automatically GCed.
 
+        Uses canonical_sha256 for the temp_link lookup to ensure cross-algorithm
+        compatibility (e.g., client mounts by sha256, blob has content_checksum sha512).
+
         This function is useful during push operations if an existing blob from another repository
         is being pushed. Returns False if the mounting fails.
         """
         with db_disallow_replica_use():
+            # Use canonical_sha256 for the link -- always SHA-256, always findable
             storage = model.blob.temp_link_blob(
-                target_repository_ref._db_id, blob.digest, expiration_sec
+                target_repository_ref._db_id,
+                blob.canonical_sha256,
+                expiration_sec,
             )
             return bool(storage)
 
@@ -1327,7 +1373,8 @@ class OCIModel(RegistryDataInterface):
         if not len(local_blob_digests):
             return []
 
-        blob_query = self._lookup_repo_storages_by_content_checksum(
+        # Use canonical_sha256 lookup (manifest digests are always sha256:...)
+        blob_query = self._lookup_repo_storages_by_canonical_sha256(
             repo_id, local_blob_digests, storage
         )
         blobs = []
@@ -1350,6 +1397,10 @@ class OCIModel(RegistryDataInterface):
         Returns an *ordered list* of the layers found in the manifest, starting at the base and
         working towards the leaf, including the associated Blob and its placements (if specified).
 
+        Uses canonical_sha256 for storage lookup because OCI manifest layer descriptors
+        embed sha256:... digests, which may not match content_checksum if the blob was
+        uploaded with a non-SHA-256 algorithm.
+
         Returns None if the manifest could not be parsed and validated.
         """
         assert not parsed.is_manifest_list
@@ -1363,10 +1414,12 @@ class OCIModel(RegistryDataInterface):
             blob_digests.append(EMPTY_LAYER_BLOB_DIGEST)
 
         if blob_digests:
-            blob_query = self._lookup_repo_storages_by_content_checksum(
+            # Use canonical_sha256 lookup instead of content_checksum
+            blob_query = self._lookup_repo_storages_by_canonical_sha256(
                 repo_id, blob_digests, storage
             )
-            storage_map = {blob.content_checksum: blob for blob in blob_query}
+            # Key by canonical_sha256 (matches manifest digest references)
+            storage_map = {blob.effective_canonical_sha256: blob for blob in blob_query}
 
         layers = parsed.get_layers(retriever)
         if layers is None:
@@ -1382,7 +1435,9 @@ class OCIModel(RegistryDataInterface):
             digest_str = str(layer.blob_digest)
             if digest_str not in storage_map:
                 logger.error(
-                    "Missing digest `%s` for manifest `%s`", layer.blob_digest, parsed.digest
+                    "Missing digest `%s` for manifest `%s`",
+                    layer.blob_digest,
+                    parsed.digest,
                 )
                 return None
 
@@ -1441,6 +1496,31 @@ class OCIModel(RegistryDataInterface):
         found = []
         if checksums:
             found = list(model.storage.lookup_repo_storages_by_content_checksum(repo, checksums))
+        return found + extra_storages
+
+    def _lookup_repo_storages_by_canonical_sha256(self, repo_id, sha256_digests, storage=None):
+        """
+        Looks up ImageStorage records by canonical_sha256 for manifest layer resolution.
+
+        This method is used instead of _lookup_repo_storages_by_content_checksum when
+        resolving manifest layers, because OCI manifest layer descriptors always reference
+        sha256:... digests, but ImageStorage.content_checksum may be a non-SHA-256 value.
+
+        Returns ImageStorage records with canonical_sha256 populated for map keying.
+        """
+        checksums = set(sha256_digests)
+        extra_storages = []
+
+        # Load shared storages first (e.g., EMPTY_LAYER_BLOB_DIGEST -- always SHA-256)
+        for checksum in list(checksums):
+            shared_storage = self._get_shared_storage(checksum, storage=storage)
+            if shared_storage is not None:
+                extra_storages.append(shared_storage)
+                checksums.remove(checksum)
+
+        found = []
+        if checksums:
+            found = list(model.storage.lookup_repo_storages_by_canonical_sha256(repo_id, checksums))
         return found + extra_storages
 
 

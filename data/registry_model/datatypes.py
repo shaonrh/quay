@@ -662,12 +662,23 @@ class Blob(
         return Blob(
             db_id=image_storage.id,
             uuid=image_storage.uuid,
-            inputs=dict(placements=placements, storage_path=storage_path),
+            inputs=dict(
+                placements=placements,
+                storage_path=storage_path,
+                canonical_sha256=image_storage.effective_canonical_sha256,
+            ),
             digest=image_storage.content_checksum,
             compressed_size=image_storage.image_size,
             uncompressed_size=image_storage.uncompressed_size,
             uploading=image_storage.uploading,
         )
+
+    @property
+    def canonical_sha256(self):
+        """
+        Internal identity -- always SHA-256. Used for storage paths, GC, locks, mounts.
+        """
+        return self._inputs.get("canonical_sha256")
 
     @property
     @requiresinput("storage_path")

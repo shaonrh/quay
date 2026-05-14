@@ -449,8 +449,8 @@ class _BlobUploadManager(object):
         (SHA-256 for standard uploads, client-algorithm for multi-algorithm uploads using
         speculatively computed hashes).
         """
-        # Determine the client-algorithm digest string for DigestAlias creation
         client_digest_str = None
+        parsed_digest = None
 
         if expected_digest is not None:
             multi_algo_enabled = app_config.get("FEATURE_MULTI_ALGORITHM_SUPPORT", False)
@@ -472,14 +472,19 @@ class _BlobUploadManager(object):
         storage_already_existed = self._finalize_blob_storage(app_config)
 
         # Compute the canonical SHA-256 digest (always from sha_state)
-        computed_digest_str = digest_tools.sha256_digest_from_hashlib(self.blob_upload.sha_state)
+        canonical_sha256 = digest_tools.sha256_digest_from_hashlib(self.blob_upload.sha_state)
+
+        # Determine what goes into content_checksum:
+        # - If client provided non-SHA-256: use client's digest
+        # - If client provided SHA-256 (or no digest): use SHA-256
+        content_checksum = client_digest_str if client_digest_str else canonical_sha256
 
         with db_transaction():
             blob = registry_model.commit_blob_upload(
                 self.blob_upload,
-                computed_digest_str,
+                content_checksum,
+                canonical_sha256,
                 self.settings.committed_blob_expiration,
-                client_digest_str=client_digest_str,
             )
             if blob is None:
                 return None

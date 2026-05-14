@@ -1,4 +1,5 @@
 import logging
+import re
 from functools import wraps
 
 from flask import Response, request, url_for
@@ -15,6 +16,7 @@ from data.model import (
     TagDoesNotExist,
     namespacequota,
 )
+from data.model.oci import tag as oci_tag
 from data.model.oci.manifest import CreateManifestException
 from data.model.oci.tag import RetargetTagException
 from data.registry_model import registry_model
@@ -35,6 +37,7 @@ from endpoints.decorators import (
 from endpoints.metrics import image_pulls, image_pushes
 from endpoints.v2 import require_repo_read, require_repo_write, v2_bp
 from endpoints.v2.errors import (
+    InvalidRequest,
     ManifestInvalid,
     ManifestUnknown,
     NameInvalid,
@@ -333,54 +336,239 @@ def _enqueue_blobs_for_replication(manifest, storage, namespace_name):
 @check_pushes_disabled
 def write_manifest_by_digest(namespace_name, repo_name, manifest_ref):
     parsed = _parse_manifest(request.content_type, request.data)
-    if parsed.digest != manifest_ref:
-        image_pushes.labels("v2", 400, "").inc()
-        raise ManifestInvalid(detail={"message": "manifest digest mismatch"})
 
-    if parsed.schema_version != 2:
+    # Determine if this is a non-SHA-256 digest push
+    parsed_ref = digest_tools.Digest.parse_digest(manifest_ref)
+    is_alias_digest = parsed_ref.hash_alg != "sha256"
+
+    if is_alias_digest:
+        # Require FEATURE_MULTI_ALGORITHM_SUPPORT for non-SHA-256 digests
+        if not app.config.get("FEATURE_MULTI_ALGORITHM_SUPPORT", False):
+            image_pushes.labels("v2", 400, "").inc()
+            raise ManifestInvalid(detail={"message": "non-SHA-256 digest not supported"})
+
+        # Validate algorithm is allowed
+        # TODO: Move _validate_digest_algorithm to digest/digest_tools.py in a follow-up
+        from endpoints.v2.blob import _validate_digest_algorithm
+
+        _validate_digest_algorithm(manifest_ref)
+
+        # Reject non-SHA-256 for Schema v1 manifests (out of scope per spec)
+        if parsed.schema_version != 2:
+            image_pushes.labels("v2", 400, "").inc()
+            raise ManifestInvalid(
+                detail={"message": "non-SHA-256 digest not supported for Schema v1 manifests"}
+            )
+
+        # Compute the requested algorithm's hash of the manifest body
+        computed = digest_tools.compute_digest(parsed_ref.hash_alg, request.data)
+        if computed != manifest_ref:
+            image_pushes.labels("v2", 400, "").inc()
+            raise ManifestInvalid(detail={"message": "digest mismatch"})
+    else:
+        # SHA-256: use existing comparison
+        if parsed.digest != manifest_ref:
+            image_pushes.labels("v2", 400, "").inc()
+            raise ManifestInvalid(detail={"message": "manifest digest mismatch"})
+
+    # Handle tag query parameters (OCI end-7b)
+    tag_names = request.args.getlist("tag")
+    # Deduplicate while preserving order
+    seen = set()
+    unique_tags = []
+    for t in tag_names:
+        if t not in seen:
+            seen.add(t)
+            unique_tags.append(t)
+    tag_names = unique_tags
+
+    # Enforce tag limit
+    max_tags = app.config.get("MULTI_ALGO_MAX_TAGS_PER_REQUEST", 100)
+    if len(tag_names) > max_tags:
+        raise InvalidRequest(message=f"Too many tags: {len(tag_names)} exceeds limit of {max_tags}")
+
+    # Validate tag names
+    for t in tag_names:
+        if not re.fullmatch(VALID_TAG_PATTERN, t):
+            raise InvalidRequest(message=f"Invalid tag name: {t}")
+
+    # Schema v1 handling: if no alias digest and no tag params, fall through to
+    # existing tag-based write using the embedded tag name
+    if parsed.schema_version != 2 and not tag_names and not is_alias_digest:
         return _write_manifest_and_log(namespace_name, repo_name, parsed.tag, parsed)
 
-    # If the manifest is schema version 2, then this cannot be a normal tag-based push, as the
-    # manifest does not contain the tag and this call was not given a tag name.
-    # Instead, we write the manifest with a temporary tag, as it is being pushed
-    # as part of a call for a manifest list.
-    repository_ref = registry_model.lookup_repository(
-        namespace_name, repo_name, model_cache=model_cache
-    )
-    if repository_ref is None:
-        image_pushes.labels("v2", 404, "").inc()
-        raise NameUnknown("repository not found")
+    with db_disallow_replica_use():
+        repository_ref = registry_model.lookup_repository(
+            namespace_name, repo_name, model_cache=model_cache
+        )
+        if repository_ref is None:
+            image_pushes.labels("v2", 404, "").inc()
+            raise NameUnknown("repository not found")
 
-    expiration_sec = app.config["PUSH_TEMP_TAG_EXPIRATION_SEC"]
-    manifest = registry_model.create_manifest_with_temp_tag(
-        repository_ref,
-        parsed,
-        expiration_sec,
-        storage,
-    )
+        manifest = None
+        tag = None
+        created_tags = []
 
-    if manifest is None:
-        image_pushes.labels("v2", 400, "").inc()
-        raise ManifestInvalid()
+        if tag_names:
+            # Use create_manifest_and_retarget_tag for the FIRST tag
+            # (handles manifest creation + quota verification)
+            first_tag = tag_names[0]
+            try:
+                manifest, tag = registry_model.create_manifest_and_retarget_tag(
+                    repository_ref,
+                    parsed,
+                    first_tag,
+                    storage,
+                    raise_on_error=True,
+                    verify_quota=app.config.get("FEATURE_QUOTA_MANAGEMENT", False)
+                    and app.config.get("FEATURE_VERIFY_QUOTA", True),
+                )
+            except CreateManifestException as cme:
+                raise ManifestInvalid(detail={"message": str(cme)})
+            except RetargetTagException as rte:
+                raise ManifestInvalid(detail={"message": str(rte)})
+            except ImmutableTagException:
+                # First tag is immutable -- still create manifest with temp tag
+                logger.warning("Skipping immutable tag %s during end-7b push", first_tag)
+                # Fall back to temp tag for manifest creation
+                expiration_sec = app.config["PUSH_TEMP_TAG_EXPIRATION_SEC"]
+                manifest = registry_model.create_manifest_with_temp_tag(
+                    repository_ref,
+                    parsed,
+                    expiration_sec,
+                    storage,
+                )
+                if manifest is None:
+                    image_pushes.labels("v2", 400, "").inc()
+                    raise ManifestInvalid()
+            except QuotaExceededException:
+                raise QuotaExceeded()
 
-    image_pushes.labels("v2", 201, manifest.media_type).inc()
+            if manifest is None:
+                image_pushes.labels("v2", 400, "").inc()
+                raise ManifestInvalid()
 
-    # Queue all blob manifests for replication.
-    if features.STORAGE_REPLICATION:
-        _enqueue_blobs_for_replication(manifest, storage, namespace_name)
+            # If first tag succeeded, record it
+            if tag is not None:
+                created_tags.append(first_tag)
 
-    return Response(
-        "OK",
-        status=201,
-        headers={
+            # Use oci.tag.retarget_tag() directly for subsequent tags
+            for tag_name in tag_names[1:]:
+                try:
+                    result_tag = oci_tag.retarget_tag(
+                        tag_name,
+                        manifest._db_id,
+                        raise_on_error=True,
+                    )
+                    if result_tag is not None:
+                        created_tags.append(tag_name)
+                except ImmutableTagException:
+                    logger.warning("Skipping immutable tag %s during end-7b push", tag_name)
+                    continue
+                except RetargetTagException:
+                    logger.warning(
+                        "Failed to create tag %s during end-7b push",
+                        tag_name,
+                        exc_info=True,
+                    )
+                    continue
+        else:
+            # No tags: create manifest with temp tag (existing behavior)
+            expiration_sec = app.config["PUSH_TEMP_TAG_EXPIRATION_SEC"]
+            manifest = registry_model.create_manifest_with_temp_tag(
+                repository_ref,
+                parsed,
+                expiration_sec,
+                storage,
+            )
+            if manifest is None:
+                image_pushes.labels("v2", 400, "").inc()
+                raise ManifestInvalid()
+
+        # Create DigestAlias for non-SHA-256 digest
+        if is_alias_digest:
+            _create_manifest_digest_alias(manifest_ref, manifest, repository_ref)
+
+        image_pushes.labels("v2", 201, manifest.media_type).inc()
+
+        # Queue blobs for replication
+        if features.STORAGE_REPLICATION:
+            _enqueue_blobs_for_replication(manifest, storage, namespace_name)
+
+        # Audit logging and notifications for created tags
+        for tag_name in created_tags:
+            track_and_log(
+                "push_repo",
+                repository_ref,
+                tag=tag_name,
+                mediaType=manifest.media_type,
+            )
+        if created_tags:
+            spawn_notification(
+                repository_ref,
+                "repo_push",
+                {"updated_tags": created_tags},
+            )
+
+        # Build response headers
+        headers = {
             "Docker-Content-Digest": manifest.digest,
             "Location": url_for(
                 "v2.fetch_manifest_by_digest",
                 repository="%s/%s" % (namespace_name, repo_name),
                 manifest_ref=manifest.digest,
             ),
-        },
-    )
+        }
+
+        # Add OCI-Tag header for successfully created tags
+        if created_tags:
+            headers["OCI-Tag"] = ", ".join(created_tags)
+
+        return Response("OK", status=201, headers=headers)
+
+
+def _create_manifest_digest_alias(alias_digest, manifest, repository_ref):
+    """
+    Creates a DigestAlias for a manifest pushed by non-SHA-256 digest.
+    Sets manifest_id FK for unambiguous manifest alias lookup.
+    Links image_storage to one of the manifest's ManifestBlob storage rows
+    (to satisfy the NOT NULL FK constraint).
+    """
+    from data.database import Manifest as ManifestTable
+    from data.database import ManifestBlob as ManifestBlobTable
+    from data.model.blob import DigestAliasCollisionError, create_digest_alias
+
+    # Find a ManifestBlob for this manifest in this repository
+    try:
+        manifest_blob = (
+            ManifestBlobTable.select()
+            .where(
+                ManifestBlobTable.manifest == manifest._db_id,
+                ManifestBlobTable.repository == repository_ref._db_id,
+            )
+            .get()
+        )
+        image_storage = manifest_blob.blob
+
+        # Get the manifest DB row for the FK
+        manifest_row = ManifestTable.get(ManifestTable.id == manifest._db_id)
+
+        try:
+            create_digest_alias(
+                alias_digest,
+                image_storage,
+                manifest=manifest_row,
+            )
+        except DigestAliasCollisionError:
+            logger.warning(
+                "DigestAlias collision for manifest alias %s, ignoring",
+                alias_digest,
+            )
+    except ManifestBlobTable.DoesNotExist:
+        logger.warning(
+            "No ManifestBlob found for manifest %s, cannot create DigestAlias",
+            manifest.digest,
+        )
 
 
 def _parse_manifest(content_type, request_data):

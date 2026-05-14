@@ -5,6 +5,7 @@ from cachetools.func import lru_cache
 from peewee import SQL, IntegrityError
 
 from data.database import (
+    DigestAlias,
     ImageStorage,
     ImageStorageLocation,
     ImageStoragePlacement,
@@ -86,6 +87,13 @@ def _is_storage_orphaned(candidate_id):
         except UploadedBlob.DoesNotExist:
             pass
 
+        # Check DigestAlias references
+        try:
+            DigestAlias.get(image_storage=candidate_id)
+            return False
+        except DigestAlias.DoesNotExist:
+            pass
+
         # We need to check if a blob is a placeholder blob. If it is, we must **NOT** delete this blob.
         has_placement = (
             ImageStoragePlacement.select()
@@ -111,53 +119,85 @@ def garbage_collect_storage(storage_id_whitelist):
     if len(storage_id_whitelist) == 0:
         return []
 
+    # Pre-pass: clean up DigestAlias rows for storage with no other live references
+    for storage_id in storage_id_whitelist:
+        with db_transaction():
+            has_manifest_ref = ManifestBlob.select().where(ManifestBlob.blob == storage_id).exists()
+            has_upload_ref = UploadedBlob.select().where(UploadedBlob.blob == storage_id).exists()
+            if not has_manifest_ref and not has_upload_ref:
+                deleted = (
+                    DigestAlias.delete().where(DigestAlias.image_storage == storage_id).execute()
+                )
+                if deleted:
+                    logger.info(
+                        "GC pre-pass: deleted %d orphaned DigestAlias rows " "for storage %s",
+                        deleted,
+                        storage_id,
+                    )
+                    gc_table_rows_deleted.labels(table="DigestAlias").inc(deleted)
+
+    # Clean up manifest aliases pointing to deleted manifests (subquery-based)
+    with db_transaction():
+        from data.database import Manifest
+
+        stale_alias_subquery = (
+            DigestAlias.select(DigestAlias.id)
+            .where(DigestAlias.manifest.is_null(False))
+            .where(
+                ~(Manifest.select(Manifest.id).where(Manifest.id == DigestAlias.manifest).exists())
+            )
+        )
+        deleted_stale = (
+            DigestAlias.delete().where(DigestAlias.id.in_(stale_alias_subquery)).execute()
+        )
+        if deleted_stale:
+            gc_table_rows_deleted.labels(table="DigestAlias").inc(deleted_stale)
+
     def placements_to_filtered_paths_set(placements_list):
         """
-        Returns the list of paths to remove from storage, filtered from the given placements query
-        by removing any CAS paths that are still referenced by storage(s) in the database.
+        Returns paths to remove from storage, filtered by removing any CAS paths
+        still referenced by storage(s) in the database.
+
+        Uses canonical_sha256 for CAS dedup checks -- two ImageStorage rows with
+        different content_checksum but same canonical_sha256 reference the same
+        physical CAS path.
         """
         if not placements_list:
             return set()
 
         with ensure_under_transaction():
-            # Find the content checksums not referenced by other storages. Any that are, we cannot
-            # remove.
-            content_checksums = set(
-                [
-                    placement.storage.content_checksum
-                    for placement in placements_list
-                    if placement.storage.cas_path
-                ]
+            # Collect canonical_sha256 values for CAS placements
+            canonical_checksums = set(
+                placement.storage.effective_canonical_sha256
+                for placement in placements_list
+                if placement.storage.cas_path
             )
 
             unreferenced_checksums = set()
-            if content_checksums:
-                # Check the current image storage.
-                query = ImageStorage.select(ImageStorage.content_checksum).where(
-                    ImageStorage.content_checksum << list(content_checksums)
+            if canonical_checksums:
+                # Check if any ImageStorage still references these canonical_sha256 values
+                query = ImageStorage.select(ImageStorage.canonical_sha256).where(
+                    ImageStorage.canonical_sha256 << list(canonical_checksums)
                 )
                 is_referenced_checksums = set(
-                    [image_storage.content_checksum for image_storage in query]
+                    image_storage.canonical_sha256 for image_storage in query
                 )
                 if is_referenced_checksums:
                     logger.warning(
                         "GC attempted to remove CAS checksums %s, which are still IS referenced",
                         is_referenced_checksums,
                     )
+                unreferenced_checksums = canonical_checksums - is_referenced_checksums
 
-                unreferenced_checksums = content_checksums - is_referenced_checksums
-
-            # Return all placements for all image storages found not at a CAS path or with a content
-            # checksum that is referenced.
             return {
                 (
                     get_image_location_for_id(placement.location_id).name,
                     get_layer_path(placement.storage),
-                    placement.storage.content_checksum,
+                    placement.storage.effective_canonical_sha256,
                 )
                 for placement in placements_list
                 if not placement.storage.cas_path
-                or placement.storage.content_checksum in unreferenced_checksums
+                or placement.storage.effective_canonical_sha256 in unreferenced_checksums
             }
 
     # Note: Both of these deletes must occur in the same transaction (unfortunately) because a
@@ -197,6 +237,13 @@ def garbage_collect_storage(storage_id_whitelist):
                 .execute()
             )
 
+            # Delete DigestAlias rows before ImageStorage deletion
+            deleted_digest_alias = (
+                DigestAlias.delete()
+                .where(DigestAlias.image_storage == storage_id_to_check)
+                .execute()
+            )
+
             deleted_image_storage = (
                 ImageStorage.delete().where(ImageStorage.id == storage_id_to_check).execute()
             )
@@ -206,6 +253,7 @@ def garbage_collect_storage(storage_id_whitelist):
             # the database with the same content checksum.
             paths_to_remove.extend(placements_to_filtered_paths_set(placements_to_remove))
 
+        gc_table_rows_deleted.labels(table="DigestAlias").inc(deleted_digest_alias)
         gc_table_rows_deleted.labels(table="ImageStorageSignature").inc(
             deleted_image_storage_signature
         )
@@ -220,21 +268,20 @@ def garbage_collect_storage(storage_id_whitelist):
     paths_to_remove = list(set(paths_to_remove))
     for location_name, image_path, storage_checksum in paths_to_remove:
         if storage_checksum:
+            # storage_checksum is now canonical_sha256 (always sha256:...)
+            # from placements_to_filtered_paths_set
+
             # Skip any specialized blob digests that we know we should keep around.
             if storage_checksum in SPECIAL_BLOB_DIGESTS:
                 continue
 
-            # Perform one final check to ensure the blob is not needed.
-            # Note: GlobalLock ensures that deletion is atomic with the database operation, but does not
-            # avoid *all* race conditions. However, it does make the window extremely small, potentially
-            # happening only between the check and actual deletion under lock. Mitigations added in
-            # _is_storage_orphaned and the UploadedBlob check should ensure further narrow the possible
-            # race condition window.
+            # Lock on canonical_sha256 -- same key used by blob creation
             try:
                 with GlobalLock(f"BLOB_DELETE_{storage_checksum}", lock_ttl=120):
+                    # Final safety check: any ImageStorage still references this SHA-256?
                     if (
                         ImageStorage.select()
-                        .where(ImageStorage.content_checksum == storage_checksum)
+                        .where(ImageStorage.canonical_sha256 == storage_checksum)
                         .exists()
                     ):
                         continue
@@ -242,10 +289,10 @@ def garbage_collect_storage(storage_id_whitelist):
                     logger.debug("Removing %s from %s", image_path, location_name)
                     config.store.remove({location_name}, image_path)
                     gc_storage_blobs_deleted.inc()
-            # If a lock cannot be acquired, skip deletion of the blob from storage backend (safe option)
             except LockNotAcquiredException:
                 logger.debug(
-                    "Could not acquire lock for blob %s, skipping deletion", storage_checksum
+                    "Could not acquire lock for blob %s, skipping deletion",
+                    storage_checksum,
                 )
                 continue
     return orphaned_storage_ids
@@ -338,58 +385,85 @@ def with_blob_lock_or_fallback(digest, func, *args, **kwargs):
         return func(*args, skip_lock=False, **kwargs)
 
 
-def _get_or_create_blob_with_lock(digest, lock_acquired=True, **blob_attrs):
+def _get_or_create_blob_with_lock(
+    content_checksum, canonical_sha256, lock_acquired=True, **blob_attrs
+):
     """
-    Gets or creates the ImageStorage reference for the provided blob digest. If the reference to the blob
-    does not exists in storage, we attempt to create it. If during creation an integrity error is raised (meaning
-    another worker has created the reference already), we return the found reference.
+    Gets or creates the ImageStorage reference. Dedup lookup by canonical_sha256.
+    Creates with both content_checksum and canonical_sha256.
     """
+    # Try to find existing by canonical_sha256 (dedup)
+    existing = (
+        ImageStorage.select().where(ImageStorage.canonical_sha256 == canonical_sha256).first()
+    )
+    if existing is not None:
+        return existing
+
+    if not lock_acquired:
+        logger.warning("Creating blob %s without lock as fallback", canonical_sha256)
     try:
-        return ImageStorage.get(content_checksum=digest)
-    except ImageStorage.DoesNotExist:
-        if not lock_acquired:
-            logger.warning("Creating blob %s without lock as fallback", digest)
-        try:
-            return ImageStorage.create(content_checksum=digest, **blob_attrs)
-        except IntegrityError as e:
-            logger.warning("Another worker already created blob %s: %s", digest, e)
-            return ImageStorage.get(content_checksum=digest)
+        return ImageStorage.create(
+            content_checksum=content_checksum,
+            canonical_sha256=canonical_sha256,
+            **blob_attrs,
+        )
+    except IntegrityError as e:
+        logger.warning("Another worker already created blob %s: %s", canonical_sha256, e)
+        existing = (
+            ImageStorage.select().where(ImageStorage.canonical_sha256 == canonical_sha256).first()
+        )
+        if existing is not None:
+            return existing
+        # Ultimate fallback: try by content_checksum
+        return ImageStorage.get(content_checksum=content_checksum)
 
 
-def get_or_create_blob_with_lock(digest, skip_lock=False, **blob_attrs):
+def get_or_create_blob_with_lock(
+    content_checksum=None, canonical_sha256=None, digest=None, skip_lock=False, **blob_attrs
+):
     """
     Atomically gets or creates an ImageStorage blob, coordinating with GC deletion.
 
-    This function uses the same GlobalLock as the GC blob deletion path to ensure
-    mutual exclusion between blob creation and deletion, preventing the race condition
-    where a blob could be deleted from storage while a database record is being created.
+    Lock key is canonical_sha256 (always SHA-256) to match GC's lock key.
+    Lookup and creation use canonical_sha256 for dedup.
 
     Args:
-        digest: The blob digest (e.g., "sha256:abc123...")
-        skip_lock: If False (default), acquire a lock inside this function. If True, assume that the lock
-        is already held by the caller function.
-        **blob_attrs: Additional attributes to pass to ImageStorage.create() if creating
+        content_checksum: Client-facing digest (algorithm-agnostic)
+        canonical_sha256: Always SHA-256 digest for lock key and dedup
+        digest: Legacy parameter -- used as both content_checksum and canonical_sha256
+            when the new parameters are not provided (backward compatibility)
+        skip_lock: If True, assume caller holds the lock
+        **blob_attrs: Additional attributes to pass to ImageStorage.create()
 
     Returns:
         ImageStorage object (either existing or newly created)
     """
+    # Backward compatibility: if 'digest' is passed but not the new params,
+    # use it for both (existing callers always pass SHA-256)
+    if content_checksum is None and digest is not None:
+        content_checksum = digest
+    if canonical_sha256 is None and digest is not None:
+        canonical_sha256 = digest
+    if canonical_sha256 is None:
+        canonical_sha256 = content_checksum
+
     if skip_lock:
-        # Caller function holds the lock so we don't need to create a new one
-        return _get_or_create_blob_with_lock(digest, lock_acquired=True, **blob_attrs)
+        return _get_or_create_blob_with_lock(
+            content_checksum, canonical_sha256, lock_acquired=True, **blob_attrs
+        )
     if GlobalLock.lock_factory is None:
-        # No locking configured, proceed without lock
-        return _get_or_create_blob_with_lock(digest, lock_acquired=False, **blob_attrs)
+        return _get_or_create_blob_with_lock(
+            content_checksum, canonical_sha256, lock_acquired=False, **blob_attrs
+        )
     try:
-        with GlobalLock(f"BLOB_DELETE_{digest}", lock_ttl=30):
-            # If multiple workers try to create a blob at the same time, we must ensure that blob creation doesn't
-            # fail. Otherwise, push will fail.
-            return _get_or_create_blob_with_lock(digest, lock_acquired=True, **blob_attrs)
+        with GlobalLock(f"BLOB_DELETE_{canonical_sha256}", lock_ttl=30):
+            return _get_or_create_blob_with_lock(
+                content_checksum, canonical_sha256, lock_acquired=True, **blob_attrs
+            )
     except LockNotAcquiredException:
-        # If we cannot acquire a lock, check if we have the ImageStorage entries for the provided
-        # digest. If that reading fails, then create new entries in the table anyway but report
-        # the lock failure in the log. If multiple workers try to create a blob at the same time, we must ensure
-        # that blob creation doesn't fail. Otherwise, push will fail.
-        return _get_or_create_blob_with_lock(digest, lock_acquired=False, **blob_attrs)
+        return _get_or_create_blob_with_lock(
+            content_checksum, canonical_sha256, lock_acquired=False, **blob_attrs
+        )
 
 
 def get_storage_by_uuid(storage_uuid):
@@ -405,10 +479,13 @@ def get_storage_by_uuid(storage_uuid):
 def get_layer_path(storage_record):
     """
     Returns the path in the storage engine to the layer data referenced by the storage row.
+    Uses canonical_sha256 for CAS path computation.
     """
     assert storage_record.cas_path is not None
     return get_layer_path_for_storage(
-        storage_record.uuid, storage_record.cas_path, storage_record.content_checksum
+        storage_record.uuid,
+        storage_record.cas_path,
+        storage_record.effective_canonical_sha256,
     )
 
 
@@ -487,6 +564,77 @@ def _lookup_repo_storages_by_content_checksum(repo, checksums, model_class):
     # If the number of queries is too large, the UNION query
     # generated crashes gunicorn, instead run each query
     # individually
+    if len(queries) > 1000:
+        result = [next(iter(q.execute()), None) for q in queries]
+        return [r for r in result if r is not None]
+
+    return _basequery.reduce_as_tree(queries)
+
+
+def lookup_repo_storages_by_canonical_sha256(repo, checksums, with_uploads=False):
+    """
+    Looks up repository storages by canonical_sha256 values.
+    Same structure as lookup_repo_storages_by_content_checksum but queries
+    canonical_sha256 instead.
+    """
+    if not checksums:
+        return []
+
+    if not with_uploads:
+        return _lookup_repo_storages_by_canonical_sha256(repo, checksums, ManifestBlob)
+
+    # Check UploadedBlob first, then ManifestBlob for remaining
+    found_via_uploaded = list(
+        _lookup_repo_storages_by_canonical_sha256(repo, checksums, UploadedBlob)
+    )
+    if len(found_via_uploaded) == len(checksums):
+        return found_via_uploaded
+
+    checksums_remaining = set(checksums) - {
+        uploaded.canonical_sha256 for uploaded in found_via_uploaded
+    }
+    found_via_manifest = list(
+        _lookup_repo_storages_by_canonical_sha256(repo, checksums_remaining, ManifestBlob)
+    )
+    return found_via_uploaded + found_via_manifest
+
+
+def _lookup_repo_storages_by_canonical_sha256(repo, checksums, model_class):
+    """
+    Inner lookup using balanced union trees via _basequery.reduce_as_tree.
+    Mirrors _lookup_repo_storages_by_content_checksum exactly, querying
+    canonical_sha256 instead of content_checksum.
+    """
+    assert checksums
+
+    queries = []
+    for counter, checksum in enumerate(checksums):
+        query_alias = "q{0}".format(counter)
+
+        candidate_subq = (
+            ImageStorage.select(
+                ImageStorage.id,
+                ImageStorage.content_checksum,
+                ImageStorage.canonical_sha256,
+                ImageStorage.image_size,
+                ImageStorage.uuid,
+                ImageStorage.cas_path,
+                ImageStorage.uncompressed_size,
+            )
+            .join(model_class)
+            .where(
+                model_class.repository == repo,
+                ImageStorage.canonical_sha256 == checksum,
+            )
+            .limit(1)
+            .alias(query_alias)
+        )
+
+        queries.append(ImageStorage.select(SQL("*")).from_(candidate_subq))
+
+    assert queries
+
+    # Prevent crash on gunicorn (PROJQUAY-7603)
     if len(queries) > 1000:
         result = [next(iter(q.execute()), None) for q in queries]
         return [r for r in result if r is not None]

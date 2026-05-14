@@ -75,8 +75,10 @@ def check_blob_exists(namespace_name, repo_name, digest, registry_model):
         raise BlobUnknown()
 
     # Build the response headers.
+    # Always use the canonical SHA-256 digest from storage, not the request digest
+    # (which may be a non-SHA-256 alias digest).
     headers = {
-        "Docker-Content-Digest": digest,
+        "Docker-Content-Digest": blob.digest,
         "Content-Length": blob.compressed_size,
         "Content-Type": BLOB_CONTENT_TYPE,
     }
@@ -104,7 +106,8 @@ def download_blob(namespace_name, repo_name, digest, registry_model):
         raise BlobUnknown()
 
     # Build the response headers.
-    headers = {"Docker-Content-Digest": digest}
+    # Always use the canonical SHA-256 digest from storage, not the request digest.
+    headers = {"Docker-Content-Digest": blob.digest}
 
     # If our storage supports range requests, let the client know.
     if storage.get_supports_resumable_downloads(blob.placements):
@@ -242,12 +245,12 @@ def _try_to_mount_blob(repository_ref, mount_blob_digest):
     return Response(
         status=201,
         headers={
-            "Docker-Content-Digest": mount_blob_digest,
+            "Docker-Content-Digest": mount_blob.digest,
             "Location": get_app_url()
             + url_for(
                 "v2.download_blob",
                 repository="%s/%s" % (namespace_name, repo_name),
-                digest=mount_blob_digest,
+                digest=mount_blob.digest,
             ),
         },
     )

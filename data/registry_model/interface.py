@@ -371,12 +371,16 @@ class RegistryDataInterface(object):
 
     @abstractmethod
     def commit_blob_upload(
-        self, blob_upload, blob_digest_str, blob_expiration_seconds, client_digest_str=None
+        self, blob_upload, content_checksum, canonical_sha256, blob_expiration_seconds
     ):
         """
         Commits the blob upload into a blob and sets an expiration before that blob will be GCed.
-        If client_digest_str is provided (non-SHA-256 digest), creates a DigestAlias mapping it
-        to the ImageStorage record.
+
+        Args:
+            blob_upload: BlobUpload reference
+            content_checksum: Client-facing digest (algorithm-agnostic, e.g. sha512:xxx or sha256:yyy)
+            canonical_sha256: Always SHA-256 digest for internal operations
+            blob_expiration_seconds: Expiration for the temp link
         """
 
     @abstractmethod

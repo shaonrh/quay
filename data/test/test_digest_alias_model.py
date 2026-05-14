@@ -49,7 +49,12 @@ def test_db():
         visibility=visibility,
         kind=repo_kind,
     )
-    storage = ImageStorage.create(uuid="test-uuid-1234", cas_path=True)
+    storage = ImageStorage.create(
+        uuid="test-uuid-1234",
+        cas_path=True,
+        content_checksum="sha256:test1234",
+        canonical_sha256="sha256:test1234",
+    )
     location = ImageStorageLocation.create(name="local_us")
 
     yield {

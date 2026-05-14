@@ -29,7 +29,10 @@ from data.model.oci.tag import (
     get_child_manifests,
 )
 from data.model.quota import QuotaOperation, update_quota
-from data.model.storage import lookup_repo_storages_by_content_checksum
+from data.model.storage import (
+    lookup_repo_storages_by_canonical_sha256,
+    lookup_repo_storages_by_content_checksum,
+)
 from image.docker.schema1 import ManifestException
 from image.docker.schema2 import EMPTY_LAYER_BLOB_DIGEST, EMPTY_LAYER_BYTES
 from image.docker.schema2.list import MalformedSchema2ManifestList
@@ -151,6 +154,71 @@ def _lookup_manifest(repository_id, manifest_digest, allow_dead=False, allow_hid
         Tag, on=(Tag.manifest == ManifestChild.manifest)
     )
 
+    query = filter_to_alive_tags(query, allow_hidden=allow_hidden)
+
+    try:
+        return query.get()
+    except Manifest.DoesNotExist:
+        return None
+
+
+def lookup_manifest_by_digest_alias(
+    repository_id, alias_digest, allow_dead=False, allow_hidden=False
+):
+    """
+    Resolves a non-SHA-256 digest to a Manifest via the DigestAlias.manifest FK.
+    Returns the Manifest row or None.
+    """
+    from data.database import DigestAlias
+
+    try:
+        alias = DigestAlias.get(DigestAlias.digest == alias_digest)
+    except DigestAlias.DoesNotExist:
+        return None
+
+    if alias.manifest_id is None:
+        # This is a blob alias, not a manifest alias
+        return None
+
+    # Direct lookup by manifest_id -- unambiguous
+    return _lookup_manifest_by_id(
+        repository_id,
+        alias.manifest_id,
+        allow_dead=allow_dead,
+        allow_hidden=allow_hidden,
+    )
+
+
+def _lookup_manifest_by_id(repository_id, manifest_id, allow_dead=False, allow_hidden=False):
+    """
+    Looks up a manifest by its ID within a repository, applying alive-tag filtering.
+    """
+    query = (
+        Manifest.select()
+        .where(Manifest.id == manifest_id)
+        .where(Manifest.repository == repository_id)
+    )
+
+    if allow_dead:
+        try:
+            return query.get()
+        except Manifest.DoesNotExist:
+            return None
+
+    # Filter to alive tags
+    try:
+        return filter_to_alive_tags(query.join(Tag), allow_hidden=allow_hidden).get()
+    except Manifest.DoesNotExist:
+        pass
+
+    # Try as child of manifest with alive tag
+    query = (
+        Manifest.select()
+        .where(Manifest.id == manifest_id)
+        .where(Manifest.repository == repository_id)
+        .join(ManifestChild, on=(ManifestChild.child_manifest == Manifest.id))
+        .join(Tag, on=(Tag.manifest == ManifestChild.manifest))
+    )
     query = filter_to_alive_tags(query, allow_hidden=allow_hidden)
 
     try:
@@ -510,8 +578,11 @@ def _build_blob_map(
             return None
 
     if digests:
-        query = lookup_repo_storages_by_content_checksum(repository_id, digests, with_uploads=True)
-        blob_map.update({s.content_checksum: s for s in query})
+        # Use canonical_sha256 for lookup (manifest digests are always sha256:...)
+        # with_uploads=True to check both ManifestBlob and UploadedBlob tables
+        query = lookup_repo_storages_by_canonical_sha256(repository_id, digests, with_uploads=True)
+        # Key by canonical_sha256 (matches manifest digest references)
+        blob_map.update({s.effective_canonical_sha256: s for s in query})
         for digest_str in digests:
             if digest_str not in blob_map:
                 logger.warning(

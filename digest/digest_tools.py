@@ -96,6 +96,30 @@ def digest_from_hashlib(hash_alg, hash_obj):
     return "{0}:{1}".format(hash_alg, hash_obj.hexdigest())
 
 
+def compute_digest(algorithm, data):
+    """
+    Computes the digest of data using the given OCI algorithm name.
+    Handles the OCI-to-hashlib name mapping (e.g., sha3-256 -> sha3_256).
+
+    Args:
+        algorithm: OCI algorithm name (e.g., "sha256", "sha512", "sha3-256")
+        data: bytes to hash
+
+    Returns:
+        Digest string like "sha512:abcdef..."
+
+    Raises:
+        ValueError: if the algorithm is not supported by hashlib
+    """
+    hashlib_name = algorithm.replace("-", "_")  # sha3-256 -> sha3_256
+    try:
+        h = hashlib.new(hashlib_name)
+    except ValueError:
+        raise ValueError(f"Unsupported hash algorithm: {algorithm} (hashlib name: {hashlib_name})")
+    h.update(data)
+    return f"{algorithm}:{h.hexdigest()}"
+
+
 def digests_equal(lhs_digest_string, rhs_digest_string):
     """
     Parse and compare the two digests, returns True if the digests are equal, False otherwise.
