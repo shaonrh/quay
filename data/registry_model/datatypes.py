@@ -699,6 +699,8 @@ class BlobUpload(
             "storage_metadata",
             "piece_sha_state",
             "piece_hashes",
+            "client_hash_state",
+            "client_hash_algorithm",
         ],
     )
 ):
@@ -719,6 +721,8 @@ class BlobUpload(
             storage_metadata=blob_upload.storage_metadata,
             piece_sha_state=blob_upload.piece_sha_state,
             piece_hashes=blob_upload.piece_hashes,
+            client_hash_state=blob_upload.client_hash_state,
+            client_hash_algorithm=blob_upload.client_hash_algorithm,
         )
 
 

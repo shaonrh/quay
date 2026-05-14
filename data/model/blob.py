@@ -3,9 +3,11 @@ from datetime import datetime, timedelta
 from uuid import uuid4
 
 from peewee import IntegrityError
+from prometheus_client import Counter
 
 from data.database import (
     BlobUpload,
+    DigestAlias,
     ImageStorage,
     ImageStorageLocation,
     ImageStoragePlacement,
@@ -26,6 +28,61 @@ from data.model import storage as storage_model
 from data.model.storage import get_or_create_blob_with_lock, with_blob_lock_or_fallback
 
 logger = logging.getLogger(__name__)
+
+digest_alias_created_total = Counter(
+    "quay_digest_alias_created_total",
+    "Number of DigestAlias records created during blob uploads",
+    labelnames=["algorithm"],
+)
+
+
+class DigestAliasCollisionError(Exception):
+    """
+    Raised when a DigestAlias already exists pointing to a different ImageStorage.
+    """
+
+
+def create_digest_alias(client_digest_str, image_storage):
+    """
+    Creates a DigestAlias mapping client_digest_str to the given ImageStorage.
+    Idempotent for same-storage mappings. Raises DigestAliasCollisionError on collision.
+
+    Also increments the Prometheus counter for observability.
+    """
+    try:
+        DigestAlias.create(
+            digest=client_digest_str,
+            image_storage=image_storage,
+        )
+        logger.info(
+            "Created DigestAlias: %s -> ImageStorage %s (content_checksum=%s)",
+            client_digest_str,
+            image_storage.id,
+            image_storage.content_checksum,
+        )
+        # Increment Prometheus counter
+        algo = client_digest_str.split(":", 1)[0]
+        digest_alias_created_total.labels(algo).inc()
+    except IntegrityError:
+        existing = DigestAlias.get(DigestAlias.digest == client_digest_str)
+        if existing.image_storage_id == image_storage.id:
+            logger.debug(
+                "DigestAlias %s already exists for same ImageStorage %s, skipping",
+                client_digest_str,
+                image_storage.id,
+            )
+            return
+        else:
+            logger.error(
+                "DigestAlias collision: %s maps to ImageStorage %s but upload "
+                "resolved to ImageStorage %s",
+                client_digest_str,
+                existing.image_storage_id,
+                image_storage.id,
+            )
+            raise DigestAliasCollisionError(
+                f"Hash collision: digest {client_digest_str} maps to different blob"
+            )
 
 
 def store_blob_record_and_temp_link(

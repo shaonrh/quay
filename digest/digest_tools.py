@@ -89,6 +89,13 @@ def sha256_digest_from_hashlib(sha256_hash_obj):
     return "sha256:{0}".format(sha256_hash_obj.hexdigest())
 
 
+def digest_from_hashlib(hash_alg, hash_obj):
+    """
+    Returns a digest string like 'sha512:abcdef...' from a hash object.
+    """
+    return "{0}:{1}".format(hash_alg, hash_obj.hexdigest())
+
+
 def digests_equal(lhs_digest_string, rhs_digest_string):
     """
     Parse and compare the two digests, returns True if the digests are equal, False otherwise.

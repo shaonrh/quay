@@ -887,6 +887,23 @@
       "ct-validate": "",
       "ct-fieldgroups": ["JWTAuthentication", "Email"]
     },
+    "FEATURE_MULTI_ALGORITHM_SUPPORT": {
+      "x-example": false,
+      "type": "boolean",
+      "description": "Whether multi-algorithm digest support (SHA-384, SHA-512) is enabled for blob uploads. Defaults to False",
+      "ct-default": "false",
+      "ct-validate": "",
+      "ct-fieldgroups": ["RegistrySettings"]
+    },
+    "ALLOWED_HASH_ALGORITHMS": {
+      "x-example": ["sha256", "sha512"],
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "List of hash algorithms accepted for blob uploads. sha256 is always required. Defaults to ['sha256']",
+      "ct-default": "[\"sha256\"]",
+      "ct-validate": "",
+      "ct-fieldgroups": ["RegistrySettings"]
+    },
     "BUILDLOGS_REDIS": {
       "required": ["host"],
       "type": "object",

@@ -40,6 +40,17 @@ class _SafeUnpickler(pickle.Unpickler):
         raise pickle.UnpicklingError(f"Forbidden class: {module}.{name}")
 
 
+def safe_unpickle(data_bytes):
+    """
+    Safely unpickle data using the restricted unpickler that only allows
+    known resumable hash objects. Accepts raw bytes.
+
+    Returns the deserialized object.
+    Raises pickle.UnpicklingError if the data contains forbidden classes.
+    """
+    return _SafeUnpickler(io.BytesIO(data_bytes)).load()
+
+
 class _ResumableSHAField(TextField):
     """
     Base Class used to store the state of an in-progress hash in the database. This is particularly

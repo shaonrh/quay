@@ -1,4 +1,7 @@
+import base64
+import json
 import logging
+import pickle
 import time
 from collections import namedtuple
 from contextlib import contextmanager
@@ -7,12 +10,116 @@ import bitmath
 from prometheus_client import Counter, Histogram
 
 from data.database import CloseForLongOperation, db_transaction
+from data.fields import safe_unpickle
 from data.registry_model import registry_model
 from digest import digest_tools
 from util.registry.filelike import StreamSlice, wrap_with_handler
 from util.registry.gzipstream import calculate_size_handler
 
 logger = logging.getLogger(__name__)
+
+# Deferred import of resumablehash to avoid breaking all uploads
+# if the library is missing when the feature is disabled.
+_resumablehash = None
+
+
+def _get_resumablehash():
+    """Lazily import resumablehash. Returns the module or None if unavailable."""
+    global _resumablehash
+    if _resumablehash is None:
+        try:
+            import resumablehash
+
+            _resumablehash = resumablehash
+        except ImportError:
+            logger.warning(
+                "resumablehash library not available. "
+                "Multi-algorithm digest support will not function."
+            )
+            _resumablehash = False  # Sentinel: tried and failed
+    return _resumablehash if _resumablehash is not False else None
+
+
+def _serialize_hash_state(hasher):
+    """Serialize a resumablehash hasher to a base64 string for DB storage."""
+    return base64.b64encode(pickle.dumps(hasher)).decode("ascii")
+
+
+def _deserialize_hash_state(state_str):
+    """Deserialize a resumablehash hasher from a base64 string via safe_unpickle."""
+    data = base64.b64decode(state_str.encode("ascii"))
+    return safe_unpickle(data)
+
+
+def _get_speculative_algorithms(app_config):
+    """
+    Returns the set of non-SHA-256 algorithms from ALLOWED_HASH_ALGORITHMS
+    that should be speculatively computed during chunk uploads.
+
+    Returns an empty set if the feature is disabled or resumablehash is unavailable.
+    """
+    if not app_config.get("FEATURE_MULTI_ALGORITHM_SUPPORT", False):
+        return set()
+
+    rh = _get_resumablehash()
+    if rh is None:
+        return set()
+
+    allowed = app_config.get("ALLOWED_HASH_ALGORITHMS", ["sha256"])
+    # Filter to non-sha256 algorithms that resumablehash supports
+    speculative = set()
+    for algo in allowed:
+        if algo != "sha256" and hasattr(rh, algo):
+            speculative.add(algo)
+    return speculative
+
+
+def _create_hasher(algo_name):
+    """Create a new resumablehash hasher for the given algorithm name."""
+    rh = _get_resumablehash()
+    if rh is None:
+        return None
+    constructor = getattr(rh, algo_name, None)
+    if constructor is None:
+        return None
+    return constructor()
+
+
+def _serialize_speculative_states(hashers_dict):
+    """
+    Serialize a dict of {algo_name: hasher} to a JSON string for DB storage.
+    Each hasher is individually base64-pickled.
+    """
+    serialized = {}
+    for algo, hasher in hashers_dict.items():
+        serialized[algo] = _serialize_hash_state(hasher)
+    return json.dumps(serialized)
+
+
+def _deserialize_speculative_states(state_str):
+    """
+    Deserialize a JSON string back to a dict of {algo_name: hasher}.
+    Returns an empty dict if state_str is None or empty.
+    """
+    if not state_str:
+        return {}
+    try:
+        serialized = json.loads(state_str)
+        result = {}
+        for algo, encoded_state in serialized.items():
+            try:
+                result[algo] = _deserialize_hash_state(encoded_state)
+            except Exception:
+                logger.warning(
+                    "Failed to deserialize hash state for algorithm %s, skipping",
+                    algo,
+                    exc_info=True,
+                )
+        return result
+    except (json.JSONDecodeError, TypeError):
+        # Fallback: might be a legacy single-state string; ignore it
+        logger.warning("Failed to parse client_hash_state as JSON, treating as empty")
+        return {}
 
 
 chunk_upload_duration = Histogram(
@@ -157,6 +264,7 @@ class _BlobUploadManager(object):
         self.storage = storage
         self.extra_blob_stream_handlers = extra_blob_stream_handlers
         self.committed_blob = None
+        self._speculative_hashers = None
 
     @property
     def blob_upload_id(self):
@@ -204,7 +312,37 @@ class _BlobUploadManager(object):
             if length == 0:
                 return self.blob_upload.byte_count
 
+            # Determine which additional algorithms to hash speculatively.
+            # For chunked uploads, the client's algorithm is unknown until PUT,
+            # so we compute ALL algorithms in ALLOWED_HASH_ALGORITHMS during every chunk.
+            speculative_hashers = {}
+            try:
+                speculative_algos = _get_speculative_algorithms(app_config)
+                if speculative_algos:
+                    # Try to restore from persisted state
+                    speculative_hashers = _deserialize_speculative_states(
+                        self.blob_upload.client_hash_state
+                    )
+                    # Create hashers for any algorithms not yet initialized
+                    for algo in speculative_algos:
+                        if algo not in speculative_hashers:
+                            hasher = _create_hasher(algo)
+                            if hasher is not None:
+                                speculative_hashers[algo] = hasher
+            except Exception:
+                logger.warning(
+                    "Failed to initialize speculative hashers for upload %s, "
+                    "continuing with SHA-256 only",
+                    self.blob_upload.upload_id,
+                    exc_info=True,
+                )
+                speculative_hashers = {}
+
             input_fp = wrap_with_handler(input_fp, self.blob_upload.sha_state.update)
+
+            # Wrap with all speculative hashers
+            for _algo, hasher in speculative_hashers.items():
+                input_fp = wrap_with_handler(input_fp, hasher.update)
 
             if self.extra_blob_stream_handlers:
                 for handler in self.extra_blob_stream_handlers:
@@ -257,6 +395,15 @@ class _BlobUploadManager(object):
             # know the uncompressed size.
             uncompressed_byte_count = None
 
+        # Serialize speculative hash states for persistence
+        serialized_client_hash_state = None
+        if speculative_hashers:
+            serialized_client_hash_state = _serialize_speculative_states(speculative_hashers)
+
+        # Store speculative hashers for use in commit_to_blob() within
+        # the same request (avoids redundant deserialization for monolithic uploads)
+        self._speculative_hashers = speculative_hashers if speculative_hashers else None
+
         self.blob_upload = registry_model.update_blob_upload(
             self.blob_upload,
             uncompressed_byte_count,
@@ -264,6 +411,12 @@ class _BlobUploadManager(object):
             new_blob_bytes,
             self.blob_upload.chunk_count + 1,
             self.blob_upload.sha_state,
+            client_hash_state=(
+                serialized_client_hash_state
+                if serialized_client_hash_state
+                else self.blob_upload.client_hash_state
+            ),
+            client_hash_algorithm=self.blob_upload.client_hash_algorithm,
         )
         if self.blob_upload is None:
             raise BlobUploadException("Could not complete upload of chunk")
@@ -292,23 +445,41 @@ class _BlobUploadManager(object):
         Commits the blob upload to a blob under the repository. The resulting blob will be marked to
         not be GCed for some period of time (as configured by `committed_blob_expiration`).
 
-        If expected_digest is specified, the content digest of the data uploaded for the blob is
-        compared to that given and, if it does not match, a BlobDigestMismatchException is raised.
-        The digest given must be of type `Digest` and not a string.
+        If expected_digest is specified, validates the digest against the appropriate hash state
+        (SHA-256 for standard uploads, client-algorithm for multi-algorithm uploads using
+        speculatively computed hashes).
         """
-        # Compare the content digest.
-        if expected_digest is not None:
-            self._validate_digest(expected_digest)
+        # Determine the client-algorithm digest string for DigestAlias creation
+        client_digest_str = None
 
-        # Finalize the storage.
+        if expected_digest is not None:
+            multi_algo_enabled = app_config.get("FEATURE_MULTI_ALGORITHM_SUPPORT", False)
+            parsed_digest = digest_tools.Digest.parse_digest(expected_digest)
+
+            if parsed_digest.hash_alg != "sha256" and not multi_algo_enabled:
+                # Feature disabled but client sent non-SHA-256 digest
+                raise BlobDigestMismatchException()
+
+            if parsed_digest.hash_alg != "sha256" and multi_algo_enabled:
+                # Validate against the speculatively computed client-algorithm hash
+                self._validate_client_digest(expected_digest, parsed_digest.hash_alg)
+                client_digest_str = expected_digest
+            else:
+                # Standard SHA-256 validation (existing behavior)
+                self._validate_digest(expected_digest)
+
+        # Finalize the storage (uses SHA-256 for storage path -- unchanged)
         storage_already_existed = self._finalize_blob_storage(app_config)
 
-        # Convert the upload to a blob.
+        # Compute the canonical SHA-256 digest (always from sha_state)
         computed_digest_str = digest_tools.sha256_digest_from_hashlib(self.blob_upload.sha_state)
 
         with db_transaction():
             blob = registry_model.commit_blob_upload(
-                self.blob_upload, computed_digest_str, self.settings.committed_blob_expiration
+                self.blob_upload,
+                computed_digest_str,
+                self.settings.committed_blob_expiration,
+                client_digest_str=client_digest_str,
             )
             if blob is None:
                 return None
@@ -331,6 +502,55 @@ class _BlobUploadManager(object):
                 )
                 raise BlobDigestMismatchException()
         except digest_tools.InvalidDigestException:
+            raise BlobDigestMismatchException()
+
+    def _validate_client_digest(self, expected_digest, hash_alg):
+        """
+        Verifies the expected digest against the speculatively computed hash state
+        for the given algorithm. Used when the client provided a non-SHA-256 digest.
+
+        The hasher is retrieved from:
+        1. In-memory cache (self._speculative_hashers) if available (monolithic upload)
+        2. Deserialized from self.blob_upload.client_hash_state (chunked upload)
+        """
+        try:
+            # Try in-memory cache first (set during upload_chunk in same request)
+            client_hasher = None
+            if self._speculative_hashers and hash_alg in self._speculative_hashers:
+                client_hasher = self._speculative_hashers[hash_alg]
+            elif self.blob_upload.client_hash_state:
+                # Deserialize from DB state
+                all_hashers = _deserialize_speculative_states(self.blob_upload.client_hash_state)
+                client_hasher = all_hashers.get(hash_alg)
+
+            if client_hasher is None:
+                logger.error(
+                    "No hash state found for algorithm %s on upload %s. "
+                    "The algorithm may not have been in ALLOWED_HASH_ALGORITHMS "
+                    "during chunk uploads.",
+                    hash_alg,
+                    self.blob_upload.upload_id,
+                )
+                raise BlobDigestMismatchException()
+
+            computed_hex = client_hasher.hexdigest()
+            computed_digest = f"{hash_alg}:{computed_hex}"
+
+            if not digest_tools.digests_equal(computed_digest, expected_digest):
+                logger.error(
+                    "Client digest mismatch for upload %s: Expected %s, computed %s",
+                    self.blob_upload.upload_id,
+                    expected_digest,
+                    computed_digest,
+                )
+                raise BlobDigestMismatchException()
+        except BlobDigestMismatchException:
+            raise
+        except Exception:
+            logger.exception(
+                "Unexpected error validating client digest for upload %s",
+                self.blob_upload.upload_id,
+            )
             raise BlobDigestMismatchException()
 
     def _finalize_blob_storage(self, app_config):

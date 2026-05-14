@@ -1176,6 +1176,8 @@ class OCIModel(RegistryDataInterface):
         byte_count,
         chunk_count,
         sha_state,
+        client_hash_state=None,
+        client_hash_algorithm=None,
     ):
         """
         Updates the fields of the blob upload to match those given.
@@ -1192,6 +1194,8 @@ class OCIModel(RegistryDataInterface):
             upload_record.byte_count = byte_count
             upload_record.chunk_count = chunk_count
             upload_record.sha_state = sha_state
+            upload_record.client_hash_state = client_hash_state
+            upload_record.client_hash_algorithm = client_hash_algorithm
             upload_record.save()
             return BlobUpload.for_upload(upload_record)
 
@@ -1204,9 +1208,13 @@ class OCIModel(RegistryDataInterface):
             if upload_record is not None:
                 upload_record.delete_instance()
 
-    def commit_blob_upload(self, blob_upload, blob_digest_str, blob_expiration_seconds):
+    def commit_blob_upload(
+        self, blob_upload, blob_digest_str, blob_expiration_seconds, client_digest_str=None
+    ):
         """
         Commits the blob upload into a blob and sets an expiration before that blob will be GCed.
+        If client_digest_str is provided (non-SHA-256 digest), creates a DigestAlias mapping it
+        to the ImageStorage record.
         """
         with db_disallow_replica_use():
             upload_record = model.blob.get_blob_upload_by_uuid(blob_upload.upload_id)
@@ -1225,6 +1233,10 @@ class OCIModel(RegistryDataInterface):
                 blob_expiration_seconds,
                 blob_upload.uncompressed_byte_count,
             )
+
+            # Create DigestAlias if a client-algorithm digest was provided
+            if client_digest_str is not None:
+                model.blob.create_digest_alias(client_digest_str, blob_record)
 
             # Delete the blob upload.
             upload_record.delete_instance()

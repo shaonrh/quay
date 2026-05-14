@@ -12,8 +12,10 @@ from auth.permissions import ModifyRepositoryPermission, ReadRepositoryPermissio
 from auth.registry_jwt_auth import process_registry_jwt_auth
 from data import database
 from data.model import namespacequota
+from data.model.blob import DigestAliasCollisionError
 from data.registry_model import registry_model
 from data.registry_model.blobuploader import (
+    BlobDigestMismatchException,
     BlobRangeMismatchException,
     BlobTooLargeException,
     BlobUploadException,
@@ -39,6 +41,7 @@ from endpoints.v2.errors import (
     BlobUnknown,
     BlobUploadInvalid,
     BlobUploadUnknown,
+    DigestInvalid,
     InvalidRequest,
     LayerTooLarge,
     NameUnknown,
@@ -308,18 +311,28 @@ def start_blob_upload(namespace_name, repo_name):
             },
         )
 
+    # Validate algorithm before proceeding with monolithic upload
+    _validate_digest_algorithm(digest)
+
     # Upload the data sent and commit it to a blob.
     with complete_when_uploaded(blob_uploader):
         _upload_chunk(blob_uploader, digest)
+
+    # Use canonical SHA-256 digest for response headers.
+    canonical_digest = (
+        blob_uploader.committed_blob.digest if blob_uploader.committed_blob else digest
+    )
 
     # Write the response to the client.
     return Response(
         status=201,
         headers={
-            "Docker-Content-Digest": digest,
+            "Docker-Content-Digest": canonical_digest,
             "Location": get_app_url()
             + url_for(
-                "v2.download_blob", repository="%s/%s" % (namespace_name, repo_name), digest=digest
+                "v2.download_blob",
+                repository="%s/%s" % (namespace_name, repo_name),
+                digest=canonical_digest,
             ),
         },
     )
@@ -410,6 +423,8 @@ def monolithic_upload_or_last_chunk(namespace_name, repo_name, upload_uuid):
     if digest is None:
         raise BlobUploadInvalid(detail={"reason": "Missing digest arg on monolithic upload"})
 
+    _validate_digest_algorithm(digest)
+
     # Find the upload.
     repository_ref = registry_model.lookup_repository(namespace_name, repo_name)
     if repository_ref is None:
@@ -435,14 +450,19 @@ def monolithic_upload_or_last_chunk(namespace_name, repo_name, upload_uuid):
     with complete_when_uploaded(uploader):
         _upload_chunk(uploader, digest)
 
+    # Use canonical SHA-256 digest for response headers.
+    canonical_digest = uploader.committed_blob.digest if uploader.committed_blob else digest
+
     # Write the response to the client.
     return Response(
         status=201,
         headers={
-            "Docker-Content-Digest": digest,
+            "Docker-Content-Digest": canonical_digest,
             "Location": get_app_url()
             + url_for(
-                "v2.download_blob", repository="%s/%s" % (namespace_name, repo_name), digest=digest
+                "v2.download_blob",
+                repository="%s/%s" % (namespace_name, repo_name),
+                digest=canonical_digest,
             ),
         },
     )
@@ -482,6 +502,44 @@ def cancel_upload(namespace_name, repo_name, upload_uuid):
 def delete_digest(namespace_name, repo_name, digest):
     # We do not support deleting arbitrary digests, as they break repo images.
     raise Unsupported()
+
+
+def _validate_digest_algorithm(digest_str):
+    """
+    Validates that the digest algorithm is allowed by configuration.
+    Raises DigestInvalid if the algorithm is not supported or feature is disabled.
+
+    Note: sha256 is ALWAYS allowed regardless of ALLOWED_HASH_ALGORITHMS config.
+    """
+    if digest_str is None:
+        return
+
+    parsed = digest_tools.Digest.parse_digest(digest_str)
+    algo = parsed.hash_alg
+
+    if algo == "sha256":
+        # SHA-256 is always allowed, regardless of feature flag
+        return
+
+    # Non-SHA-256 digest requires the feature flag
+    if not app.config.get("FEATURE_MULTI_ALGORITHM_SUPPORT", False):
+        raise DigestInvalid(
+            detail={
+                "reason": f"Algorithm '{algo}' is not supported. "
+                f"Multi-algorithm support is disabled.",
+                "algorithm": algo,
+            }
+        )
+
+    allowed = app.config.get("ALLOWED_HASH_ALGORITHMS", ["sha256"])
+    if algo not in allowed:
+        raise DigestInvalid(
+            detail={
+                "reason": f"Algorithm '{algo}' is not in the allowed list.",
+                "algorithm": algo,
+                "allowed_algorithms": allowed,
+            }
+        )
 
 
 def _render_range(num_uploaded_bytes, with_bytes_prefix=True):
@@ -572,6 +630,10 @@ def _upload_chunk(blob_uploader, commit_digest=None):
             return blob_uploader.commit_to_blob(app.config, commit_digest)
     except BlobTooLargeException as ble:
         raise LayerTooLarge(uploaded=ble.uploaded, max_allowed=ble.max_allowed)
+    except BlobDigestMismatchException:
+        raise DigestInvalid()
+    except DigestAliasCollisionError:
+        raise DigestInvalid(detail={"reason": "Hash collision detected for digest alias"})
     except BlobRangeMismatchException:
         logger.exception("Exception when uploading blob to %s", blob_uploader.blob_upload_id)
         _abort_range_not_satisfiable(

@@ -354,6 +354,8 @@ class RegistryDataInterface(object):
         byte_count,
         chunk_count,
         sha_state,
+        client_hash_state=None,
+        client_hash_algorithm=None,
     ):
         """
         Updates the fields of the blob upload to match those given.
@@ -368,9 +370,13 @@ class RegistryDataInterface(object):
         """
 
     @abstractmethod
-    def commit_blob_upload(self, blob_upload, blob_digest_str, blob_expiration_seconds):
+    def commit_blob_upload(
+        self, blob_upload, blob_digest_str, blob_expiration_seconds, client_digest_str=None
+    ):
         """
         Commits the blob upload into a blob and sets an expiration before that blob will be GCed.
+        If client_digest_str is provided (non-SHA-256 digest), creates a DigestAlias mapping it
+        to the ImageStorage record.
         """
 
     @abstractmethod
