@@ -17,6 +17,7 @@ from data.model.oauth import (
     create_bootstrap_application,
     create_bootstrap_oauth_api_token,
     delete_applications,
+    delete_token_by_id,
     get_bootstrap_app_name,
     get_bootstrap_application_candidates,
     get_bootstrap_tokens,
@@ -159,6 +160,7 @@ def _provision_bootstrap_token():
     expiration = app.config["BOOTSTRAP_TOKEN_EXPIRATION"]
     bootstrap_application_name = get_bootstrap_app_name(app.config)
 
+    token_record = None
     try:
         with db_transaction():
             lock_bootstrap_token_operation()
@@ -179,7 +181,7 @@ def _provision_bootstrap_token():
                 return
 
             bootstrap_application = create_bootstrap_application(bootstrap_application_name, owner)
-            _, access_token = create_bootstrap_oauth_api_token(
+            token_record, access_token = create_bootstrap_oauth_api_token(
                 bootstrap_application,
                 owner,
                 scope,
@@ -189,6 +191,8 @@ def _provision_bootstrap_token():
             logger.info("Bootstrap token provisioned")
             return
     except OSError:
+        if token_record is not None:
+            delete_token_by_id(token_record.id)
         logger.exception("Failed to write bootstrap token, rolled back")
         return
 

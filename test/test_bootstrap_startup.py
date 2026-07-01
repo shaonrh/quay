@@ -376,11 +376,77 @@ def test_provision_file_write_failure_rolls_back_new_db_token(initialized_db, tm
         patch("boot.app") as mock_app,
         patch("boot.db_transaction", db.obj.transaction),
         patch("boot.write_bootstrap_token", side_effect=OSError("boom")),
+        patch("boot.delete_token_by_id") as mock_delete_token,
     ):
         mock_app.config = config
         setup_bootstrap_token()
 
+    mock_delete_token.assert_called_once()
     assert model.oauth.get_bootstrap_tokens(application) == []
+
+
+def test_delete_other_bootstrap_tokens_keeps_requested_bootstrap_token_only(initialized_db):
+    owner = model.user.get_user("devtable")
+    other_owner = model.user.get_user("freshuser")
+    application = model.oauth.create_bootstrap_application(
+        model.oauth.BOOTSTRAP_APP_NAME,
+        owner,
+    )
+    other_application = model.oauth.create_bootstrap_application(
+        "other-bootstrap-app",
+        other_owner,
+    )
+    keep_token, _ = model.oauth.create_bootstrap_oauth_api_token(
+        application,
+        owner,
+        "repo:read",
+    )
+    stale_token, _ = model.oauth.create_bootstrap_oauth_api_token(
+        application,
+        owner,
+        "repo:write",
+    )
+    unmarked_token, _ = model.oauth.create_user_access_token_for_application(
+        owner,
+        application,
+        "repo:admin",
+        "Bearer",
+        3600,
+    )
+    other_application_token, _ = model.oauth.create_bootstrap_oauth_api_token(
+        other_application,
+        other_owner,
+        "repo:read",
+    )
+
+    deleted_count = model.oauth.delete_other_bootstrap_tokens(
+        application,
+        keep_token_id=keep_token.id,
+        authorized_user=owner,
+    )
+
+    assert deleted_count == 1
+    assert model.oauth.lookup_access_token_by_uuid(keep_token.uuid) is not None
+    assert model.oauth.lookup_access_token_by_uuid(stale_token.uuid) is None
+    assert model.oauth.lookup_access_token_by_uuid(unmarked_token.uuid) is not None
+    assert model.oauth.lookup_access_token_by_uuid(other_application_token.uuid) is not None
+
+
+def test_delete_token_by_id_is_idempotent(initialized_db):
+    owner = model.user.get_user("devtable")
+    application = model.oauth.create_bootstrap_application(
+        model.oauth.BOOTSTRAP_APP_NAME,
+        owner,
+    )
+    token, _ = model.oauth.create_bootstrap_oauth_api_token(
+        application,
+        owner,
+        "repo:read",
+    )
+
+    assert model.oauth.delete_token_by_id(token.id) == 1
+    assert model.oauth.lookup_access_token_by_uuid(token.uuid) is None
+    assert model.oauth.delete_token_by_id(token.id) == 0
 
 
 def test_provision_missing_owner_user_skips_provisioning(initialized_db, tmp_path):

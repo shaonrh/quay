@@ -540,6 +540,24 @@ def delete_applications(applications):
         application.delete_instance(recursive=True, delete_nullable=True)
 
 
+def delete_other_bootstrap_tokens(application, keep_token_id=None, authorized_user=None):
+    """Delete bootstrap-marked tokens for an application except the ID to keep."""
+    deleted_count = 0
+    for token in get_bootstrap_tokens(application, authorized_user=authorized_user):
+        if token.id == keep_token_id:
+            continue
+
+        token.delete_instance()
+        deleted_count += 1
+
+    return deleted_count
+
+
+def delete_token_by_id(token_id):
+    """Delete a specific OAuthAccessToken by primary key."""
+    return OAuthAccessToken.delete().where(OAuthAccessToken.id == token_id).execute()
+
+
 def lock_bootstrap_token_operation():
     """Serialize bootstrap token mutations with a transaction-scoped DB lock."""
     db_advisory_xact_lock(BOOTSTRAP_TOKEN_LOCK_ID)
