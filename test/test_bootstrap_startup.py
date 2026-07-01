@@ -159,6 +159,49 @@ def test_provision_selects_most_recent_duplicate_bootstrap_app(initialized_db, t
         assert f.read() == "not-json"
 
 
+def test_validate_bootstrap_token_accepts_only_canonical_bootstrap_application(
+    initialized_db, tmp_path
+):
+    config = _app_config(tmp_path, app_name="custom-bootstrap")
+    owner = model.user.get_user("devtable")
+    other_owner = model.user.get_user("freshuser")
+
+    older_application = model.oauth.create_application(owner, "custom-bootstrap", "", "")
+    older_token, older_access_token = model.oauth.create_bootstrap_oauth_api_token(
+        older_application,
+        owner,
+        "repo:read",
+    )
+
+    other_owner_application = model.oauth.create_application(
+        other_owner,
+        "custom-bootstrap",
+        "",
+        "",
+    )
+    other_owner_token, other_owner_access_token = model.oauth.create_bootstrap_oauth_api_token(
+        other_owner_application,
+        other_owner,
+        "repo:read",
+    )
+
+    newer_application = model.oauth.create_application(owner, "custom-bootstrap", "", "")
+    newer_token, newer_access_token = model.oauth.create_bootstrap_oauth_api_token(
+        newer_application,
+        owner,
+        "repo:write",
+    )
+
+    assert model.oauth.validate_bootstrap_token(older_access_token, config) is None
+    assert model.oauth.validate_bootstrap_token(other_owner_access_token, config) is None
+
+    validated_token = model.oauth.validate_bootstrap_token(newer_access_token, config)
+    assert validated_token is not None
+    assert validated_token.uuid == newer_token.uuid
+    assert model.oauth.lookup_access_token_by_uuid(older_token.uuid) is not None
+    assert model.oauth.lookup_access_token_by_uuid(other_owner_token.uuid) is not None
+
+
 def test_provision_deletes_older_duplicate_bootstrap_apps_without_rewriting_file(
     initialized_db, tmp_path
 ):

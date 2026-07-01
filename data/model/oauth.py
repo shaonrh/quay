@@ -436,8 +436,58 @@ def get_bootstrap_tokens(application, authorized_user=None):
     return bootstrap_tokens
 
 
+def get_bootstrap_application_candidates(owner, app_config=None):
+    """Return the canonical and duplicate bootstrap-managed apps for an owner.
+
+    Applications are considered bootstrap-managed only when they are owned by the
+    configured bootstrap owner, have the configured bootstrap app name, and carry
+    at least one bootstrap-marked token for that owner. Results are ordered by
+    application ID descending through lookup_applications_by_name, so the first
+    token-bearing app is the canonical app and the remaining token-bearing apps
+    are duplicates.
+    """
+    bootstrap_application_name = get_bootstrap_app_name(app_config)
+    applications = lookup_applications_by_name(owner, bootstrap_application_name)
+
+    canonical_application = None
+    duplicate_applications = []
+    for application in applications:
+        bootstrap_tokens = get_bootstrap_tokens(application, authorized_user=owner)
+        if not bootstrap_tokens:
+            continue
+
+        if canonical_application is None:
+            canonical_application = application
+            continue
+
+        duplicate_applications.append(application)
+
+    return canonical_application, duplicate_applications
+
+
+def get_canonical_bootstrap_application(owner, app_config=None):
+    """Return the canonical bootstrap-managed app for an owner, if one exists."""
+    canonical_application, _ = get_bootstrap_application_candidates(
+        owner,
+        app_config=app_config,
+    )
+    return canonical_application
+
+
+def _get_bootstrap_owner_for_validation(app_config):
+    owner_name = app_config.get("BOOTSTRAP_TOKEN_OWNER")
+    if not owner_name:
+        return None
+
+    superusers = app_config.get("SUPER_USERS") or []
+    if owner_name not in superusers:
+        return None
+
+    return user.get_user(owner_name)
+
+
 def validate_bootstrap_token(access_token, app_config=None):
-    """Validate a token belongs to the configured bootstrap token owner."""
+    """Validate a token belongs to the configured canonical bootstrap app."""
     if app_config is None:
         app_config = config.app_config or {}
 
@@ -445,25 +495,21 @@ def validate_bootstrap_token(access_token, app_config=None):
     if found is None:
         return None
 
-    if found.application.name != get_bootstrap_app_name(app_config):
+    owner = _get_bootstrap_owner_for_validation(app_config)
+    if owner is None:
         return None
 
-    if not is_bootstrap_oauth_token(found, application=found.application):
+    canonical_application = get_canonical_bootstrap_application(owner, app_config=app_config)
+    if canonical_application is None:
         return None
 
-    owner_name = app_config.get("BOOTSTRAP_TOKEN_OWNER")
-    superusers = set(app_config.get("SUPER_USERS") or [])
-    if not owner_name or owner_name not in superusers:
+    if found.application_id != canonical_application.id:
         return None
 
-    if found.application.organization.username != owner_name:
+    if found.authorized_user_id != owner.id:
         return None
 
-    if found.authorized_user.username != owner_name:
-        return None
-
-    token_data = _bootstrap_token_data_json(found)
-    if token_data.get("owner") != owner_name:
+    if not is_bootstrap_oauth_token(found, user_obj=owner, application=canonical_application):
         return None
 
     return found

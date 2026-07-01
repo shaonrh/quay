@@ -18,6 +18,7 @@ from data.model.oauth import (
     create_bootstrap_oauth_api_token,
     delete_applications,
     get_bootstrap_app_name,
+    get_bootstrap_application_candidates,
     get_bootstrap_tokens,
     lock_bootstrap_token_operation,
     lookup_applications_by_name,
@@ -162,14 +163,11 @@ def _provision_bootstrap_token():
         with db_transaction():
             lock_bootstrap_token_operation()
 
-            applications = lookup_applications_by_name(owner, bootstrap_application_name)
-            bootstrap_applications = []
-            for application in applications:
-                if get_bootstrap_tokens(application, authorized_user=owner):
-                    bootstrap_applications.append(application)
-
-            if bootstrap_applications:
-                duplicate_applications = bootstrap_applications[1:]
+            bootstrap_application, duplicate_applications = get_bootstrap_application_candidates(
+                owner,
+                app_config=app.config,
+            )
+            if bootstrap_application is not None:
                 if duplicate_applications:
                     delete_applications(duplicate_applications)
                     logger.info(
