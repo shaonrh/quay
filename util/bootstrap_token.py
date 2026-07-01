@@ -21,7 +21,7 @@ def read_token_file(path):
     try:
         with open(path, encoding="utf-8") as f:
             token_json = f.read(MAX_BOOTSTRAP_TOKEN_FILE_BYTES + 1)
-    except (FileNotFoundError, UnicodeDecodeError):
+    except (OSError, UnicodeDecodeError):
         return None
 
     if len(token_json) > MAX_BOOTSTRAP_TOKEN_FILE_BYTES:

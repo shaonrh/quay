@@ -90,6 +90,12 @@ def test_read_token_file_invalid_utf8_returns_none(tmp_path):
     assert read_token_file(str(path)) is None
 
 
+@pytest.mark.parametrize("error", [IsADirectoryError, PermissionError])
+def test_read_token_file_open_os_error_returns_none(error):
+    with patch("builtins.open", side_effect=error("boom")):
+        assert read_token_file("/unreadable/token.json") is None
+
+
 def test_read_token_file_oversized_returns_none(tmp_path):
     path = tmp_path / "token.json"
     path.write_text("{" + " " * MAX_BOOTSTRAP_TOKEN_FILE_BYTES + "}")
