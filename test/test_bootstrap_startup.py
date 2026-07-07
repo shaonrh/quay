@@ -488,7 +488,7 @@ def test_provision_skips_file_write_when_existing_bootstrap_token_is_expired(
     assert model.oauth.lookup_access_token_by_uuid(expired_token.uuid) is not None
 
 
-def test_provision_file_write_failure_rolls_back_new_db_token(initialized_db, tmp_path):
+def test_provision_file_write_failure_keeps_new_db_token(initialized_db, tmp_path):
     from boot import setup_bootstrap_token
 
     config = _app_config(tmp_path)
@@ -511,10 +511,11 @@ def test_provision_file_write_failure_rolls_back_new_db_token(initialized_db, tm
     with (
         patch("boot.app") as mock_app,
         # The PostgreSQL test fixture already runs each test inside a transaction.
-        # Use atomic() so this rollback is scoped to the provisioning operation
-        # without rolling back this test's setup rows.
+        # Use atomic() so the provisioning transaction commits without affecting
+        # this test's setup rows.
         patch("boot.db_transaction", db.obj.atomic),
-        patch("boot.write_bootstrap_token", side_effect=OSError("boom")),
+        patch("boot.write_bootstrap_token", side_effect=OSError("boom")) as mock_write_token,
+        patch("boot.logger.exception") as mock_logger_exception,
     ):
         mock_app.config = config
         setup_bootstrap_token()
@@ -527,16 +528,22 @@ def test_provision_file_write_failure_rolls_back_new_db_token(initialized_db, tm
         previous_owner,
         model.oauth.get_bootstrap_app_name(),
     )
-    assert [existing_application.id for existing_application in applications] == [application.id]
+    assert len(applications) == 2
+    assert application.id in {existing_application.id for existing_application in applications}
     assert [existing_application.id for existing_application in previous_owner_applications] == [
         previous_application.id
     ]
+    new_access_token = mock_write_token.call_args.args[1]
+    new_token = model.oauth.validate_bootstrap_token(new_access_token, config)
+    assert new_token is not None
+    assert new_token.authorized_user_id == owner.id
     assert model.oauth.get_bootstrap_tokens(application) == []
     assert model.oauth.lookup_access_token_by_uuid(previous_token.uuid) is not None
     assert not os.path.exists(config["BOOTSTRAP_TOKEN_PATH"])
+    mock_logger_exception.assert_any_call("Failed to write bootstrap token")
 
 
-def test_provision_stale_cleanup_failure_skips_token_file_write(initialized_db, tmp_path):
+def test_provision_stale_cleanup_failure_happens_after_token_write(initialized_db, tmp_path):
     from boot import setup_bootstrap_token
 
     config = _app_config(tmp_path)
@@ -565,11 +572,13 @@ def test_provision_stale_cleanup_failure_skips_token_file_write(initialized_db, 
         mock_app.config = config
         setup_bootstrap_token()
 
-    assert mock_write_bootstrap_token.call_count == 0
+    mock_write_bootstrap_token.assert_called_once()
+    new_access_token = mock_write_bootstrap_token.call_args.args[1]
     assert not os.path.exists(config["BOOTSTRAP_TOKEN_PATH"])
-    assert (
-        model.oauth.lookup_applications_by_name(owner, model.oauth.get_bootstrap_app_name()) == []
-    )
+
+    new_token = model.oauth.validate_bootstrap_token(new_access_token, config)
+    assert new_token is not None
+    assert new_token.authorized_user_id == owner.id
     assert [
         application.id
         for application in model.oauth.lookup_applications_by_name(

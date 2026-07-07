@@ -26,8 +26,13 @@ _QUAY_BOOTSTRAP_RENEWAL_LOCATION_HEADER = "X-Quay-Bootstrap-Renewal-Location"
 _QUAY_BOOTSTRAP_RENEWAL_LOCATION_LOCAL = "local"
 
 
-class BootstrapTokenCleanupError(Exception):
-    pass
+def _delete_failed_bootstrap_token(token_id: int) -> None:
+    try:
+        with db_transaction():
+            lock_bootstrap_token_operation()
+            OAuthAccessToken.delete().where(OAuthAccessToken.id == token_id).execute()
+    except Exception:
+        logger.exception("Failed to delete bootstrap database token after token write failure")
 
 
 def _raise_invalid_bootstrap_token() -> None:
@@ -76,38 +81,40 @@ class BootstrapTokenRenew(ApiResource):
         if _is_expired(current_token) and not _is_local_bootstrap_renewal_request(request):
             _raise_invalid_bootstrap_token()
 
+        with db_transaction():
+            lock_bootstrap_token_operation()
+
+            current_token = validate_bootstrap_token(token_string, app.config)
+            if current_token is None:
+                _raise_invalid_bootstrap_token()
+
+            if _is_expired(current_token) and not _is_local_bootstrap_renewal_request(request):
+                _raise_invalid_bootstrap_token()
+
+            scope = app.config["BOOTSTRAP_TOKEN_SCOPE"]
+            expiration = app.config["BOOTSTRAP_TOKEN_EXPIRATION"]
+            application = current_token.application
+
+            new_record, new_access_token = create_bootstrap_oauth_api_token(
+                application,
+                current_token.authorized_user,
+                scope,
+                expiration_seconds=expiration,
+            )
+
+        try:
+            write_bootstrap_token(app.config, new_access_token)
+        except OSError:
+            logger.exception("Bootstrap token renewal failed while writing token")
+            _delete_failed_bootstrap_token(new_record.id)
+            raise TokenRotationError("Token rotation failed: could not write token")
+
         try:
             with db_transaction():
                 lock_bootstrap_token_operation()
-
-                current_token = validate_bootstrap_token(token_string, app.config)
-                if current_token is None:
-                    _raise_invalid_bootstrap_token()
-
-                if _is_expired(current_token) and not _is_local_bootstrap_renewal_request(request):
-                    _raise_invalid_bootstrap_token()
-
-                scope = app.config["BOOTSTRAP_TOKEN_SCOPE"]
-                expiration = app.config["BOOTSTRAP_TOKEN_EXPIRATION"]
-
-                new_record, new_access_token = create_bootstrap_oauth_api_token(
-                    current_token.application,
-                    current_token.authorized_user,
-                    scope,
-                    expiration_seconds=expiration,
-                )
-
-                try:
-                    delete_bootstrap_tokens(current_token.application, keep_token_id=new_record.id)
-                except Exception as exc:
-                    raise BootstrapTokenCleanupError() from exc
-
-                write_bootstrap_token(app.config, new_access_token)
-        except BootstrapTokenCleanupError:
+                delete_bootstrap_tokens(application, keep_token_id=new_record.id)
+        except Exception as exc:
             logger.exception("Bootstrap token renewal failed while deleting stale tokens")
-            raise TokenRotationError("Token rotation failed: could not clean up tokens")
-        except OSError:
-            logger.exception("Bootstrap token renewal failed while writing token")
-            raise TokenRotationError("Token rotation failed: could not write token")
+            raise TokenRotationError("Token rotation failed: could not clean up tokens") from exc
 
         return {"status": "rotated"}, 200

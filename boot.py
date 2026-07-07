@@ -157,49 +157,54 @@ def _provision_bootstrap_token():
     scope = app.config["BOOTSTRAP_TOKEN_SCOPE"]
     expiration = app.config["BOOTSTRAP_TOKEN_EXPIRATION"]
 
-    try:
-        with db_transaction():
-            lock_bootstrap_token_operation()
+    with db_transaction():
+        lock_bootstrap_token_operation()
 
-            bootstrap_application, stale_applications = (
-                get_singleton_bootstrap_application_candidates(owner)
-            )
-            if bootstrap_application is not None:
-                if stale_applications:
-                    delete_applications(stale_applications)
-                    logger.info(
-                        "Deleted %s stale bootstrap applications",
-                        len(stale_applications),
-                    )
-
-                # Treat the database as the startup source of truth for Phase 1 local
-                # host-file storage in standalone installations. In multi-node setups
-                # using node-local files, this host may legitimately not have the file
-                # that another host wrote. The plaintext token cannot be reconstructed
-                # from the DB, so do not rotate or recreate it solely because the local
-                # file is missing or malformed.
-                logger.info("Bootstrap token already provisioned, skipping")
-                return
-
-            bootstrap_application = create_bootstrap_application(get_bootstrap_app_name(), owner)
-            _, access_token = create_bootstrap_oauth_api_token(
-                bootstrap_application,
-                owner,
-                scope,
-                expiration_seconds=expiration,
-            )
+        bootstrap_application, stale_applications = get_singleton_bootstrap_application_candidates(
+            owner
+        )
+        if bootstrap_application is not None:
             if stale_applications:
                 delete_applications(stale_applications)
                 logger.info(
                     "Deleted %s stale bootstrap applications",
                     len(stale_applications),
                 )
-            write_bootstrap_token(app.config, access_token)
-            logger.info("Bootstrap token provisioned")
+
+            # Treat the database as the startup source of truth for Phase 1 local
+            # host-file storage in standalone installations. In multi-node setups
+            # using node-local files, this host may legitimately not have the file
+            # that another host wrote. The plaintext token cannot be reconstructed
+            # from the DB, so do not rotate or recreate it solely because the local
+            # file is missing or malformed.
+            logger.info("Bootstrap token already provisioned, skipping")
             return
+
+        bootstrap_application = create_bootstrap_application(get_bootstrap_app_name(), owner)
+        _, access_token = create_bootstrap_oauth_api_token(
+            bootstrap_application,
+            owner,
+            scope,
+            expiration_seconds=expiration,
+        )
+
+    try:
+        write_bootstrap_token(app.config, access_token)
     except OSError:
-        logger.exception("Failed to write bootstrap token, rolled back")
+        logger.exception("Failed to write bootstrap token")
         return
+
+    if stale_applications:
+        with db_transaction():
+            lock_bootstrap_token_operation()
+            delete_applications(stale_applications)
+            logger.info(
+                "Deleted %s stale bootstrap applications",
+                len(stale_applications),
+            )
+
+    logger.info("Bootstrap token provisioned")
+    return
 
 
 def _revoke_bootstrap_tokens():

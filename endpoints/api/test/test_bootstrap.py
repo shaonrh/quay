@@ -127,6 +127,7 @@ def test_renew_file_write_fails_rolls_back_db_token_changes(app, initialized_db,
         patch.dict(real_app.config, config),
         patch("endpoints.api.bootstrap.db_transaction", lambda: model.db.atomic()),
         patch("endpoints.api.bootstrap.write_bootstrap_token", side_effect=OSError("boom")),
+        patch("endpoints.api.bootstrap.logger.exception") as mock_logger_exception,
     ):
         with app.test_client() as cl:
             resp = cl.post(
@@ -141,9 +142,10 @@ def test_renew_file_write_fails_rolls_back_db_token_changes(app, initialized_db,
     assert model.oauth.validate_bootstrap_token(access_token, config) is not None
     assert len(model.oauth.get_bootstrap_tokens(application)) == 1
     assert not os.path.exists(config["BOOTSTRAP_TOKEN_PATH"])
+    mock_logger_exception.assert_any_call("Bootstrap token renewal failed while writing token")
 
 
-def test_renew_db_cleanup_failure_happens_before_file_write(app, initialized_db, tmp_path):
+def test_renew_db_cleanup_failure_happens_after_file_write(app, initialized_db, tmp_path):
     config = _bootstrap_config(tmp_path)
     _, application, old_record, access_token = _create_bootstrap_token(config)
 
@@ -165,10 +167,12 @@ def test_renew_db_cleanup_failure_happens_before_file_write(app, initialized_db,
     assert resp.status_code == 500
     assert resp.get_json()["error_type"] == "token_rotation_failed"
     assert resp.get_json()["error_message"] == "Token rotation failed: could not clean up tokens"
-    mock_write_token.assert_not_called()
+    mock_write_token.assert_called_once()
+    new_access_token = mock_write_token.call_args.args[1]
     assert model.oauth.lookup_access_token_by_uuid(old_record.uuid) is not None
     assert model.oauth.validate_bootstrap_token(access_token, config) is not None
-    assert len(model.oauth.get_bootstrap_tokens(application)) == 1
+    assert model.oauth.validate_bootstrap_token(new_access_token, config) is not None
+    assert len(model.oauth.get_bootstrap_tokens(application)) == 2
     assert not os.path.exists(config["BOOTSTRAP_TOKEN_PATH"])
 
 
